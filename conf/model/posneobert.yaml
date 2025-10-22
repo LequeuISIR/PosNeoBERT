@@ -1,0 +1,17 @@
+rope: false
+posneobert: true
+rms_norm: True
+hidden_act: swiglu
+dropout_prob: 0.1
+pos_dropout_prob: 0
+norm_eps: 1e-05
+embedding_init_range: 0.02
+decoder_init_range: 0.02
+classifier_init_range: 0.02
+pos_sem_mixed_feed_forward: true
+use_only_sem_for_decoding: true
+flash_attention: false
+num_hidden_layers: 12
+num_attention_heads : 12
+hidden_size: 720
+pos_size: 48

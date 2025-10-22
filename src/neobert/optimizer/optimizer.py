@@ -3,7 +3,7 @@ from torch.optim import AdamW, Adam
 
 from accelerate.utils import DistributedType
 
-from .soap.soap import SOAP
+# from .soap.soap import SOAP
 
 
 def get_optimizer(model: torch.nn.Module, distributed_type: DistributedType, **kwargs) -> torch.optim.Optimizer:
@@ -20,8 +20,8 @@ def get_optimizer(model: torch.nn.Module, distributed_type: DistributedType, **k
             return AdamW(model.parameters(), **kwargs)
         case "Adam":
             return Adam(model.parameters(), **kwargs)
-        case "SOAP":
-            assert distributed_type is not DistributedType.DEEPSPEED, "SOAP does not support DeepSpeed"
-            return SOAP(model.parameters(), **kwargs)
+        # case "SOAP":
+        #     assert distributed_type is not DistributedType.DEEPSPEED, "SOAP does not support DeepSpeed"
+        #     return SOAP(model.parameters(), **kwargs)
         case _:
             raise ValueError("Unrecognized optimizer name. Options are: Adam, AdamW, SOAP.")

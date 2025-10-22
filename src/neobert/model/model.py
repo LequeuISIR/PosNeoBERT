@@ -10,7 +10,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-from torch.nn.functional import scaled_dot_product_attention
+# from torch.nn.functional import scaled_dot_product_attention
 
 from typing import Any, Dict, List, Optional
 from functools import partial
@@ -28,6 +28,67 @@ from .rmsnorm import RMSNorm
 from .rotary import precompute_freqs_cis, apply_rotary_emb
 
 
+# Efficient implementation equivalent to the following:
+def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
+        is_causal=False, scale=None, enable_gqa=False, output_attentions=False) -> torch.Tensor:
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+    if is_causal:
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias = attn_mask + attn_bias
+
+    if enable_gqa:
+        key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
+        value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
+
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    attn_weight += attn_bias
+    
+
+    if output_attentions :
+        return attn_weight @ value, attn_weight
+        
+    return attn_weight @ value
+
+
+# Efficient implementation equivalent to the following:
+def posbert_scaled_dot_product_attention(query, key, attn_mask=None, dropout_p=0.0,
+        is_causal=False, scale=None, enable_gqa=False) -> torch.Tensor:
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+    if is_causal:
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias = attn_mask + attn_bias
+
+    if enable_gqa:
+        key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
+
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    
+        
+    return attn_weight 
+
+
+
 class NeoBERTConfig(PretrainedConfig):
     model_type = "neobert"
 
@@ -35,14 +96,21 @@ class NeoBERTConfig(PretrainedConfig):
     def __init__(
         self,
         hidden_size: int = 768,
+        pos_size: int = 384,
         num_hidden_layers: int = 28,
         num_attention_heads: int = 12,
-        intermediate_size: int = 3072,
-        dropout: float = 0,
+        pos_intermediate_size: int =1536,
+        intermediate_size: int =3072,
+        pos_dropout_prob: float =0.1,
+        dropout_prob: float =0.1,
+        attention_probs_dropout_prob: float =0.1,
+        use_only_sem_for_decoding: bool = False,
+        mixed_feed_forward: bool = True,
         embedding_init_range: float = 0.02,
         decoder_init_range: float = 0.02,
         rms_norm: bool = True,
         rope: bool = True,
+        posneobert: bool = False,
         norm_eps: float = 1e-06,
         hidden_act: str = "SwiGLU",
         vocab_size: int = 32064,
@@ -51,22 +119,39 @@ class NeoBERTConfig(PretrainedConfig):
         flash_attention: bool = True,
         base_scale: float = 1.0 / (960.0**0.5),
         ngpt: bool = False,
+        positional_embed_init: str = "random",
         **kwargs,
     ):
         super().__init__(**kwargs)
-
-        self.hidden_size = hidden_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
+        if rope and posneobert :
+            raise ValueError("cant be rope and posneobert at the same time")
+        if ngpt and posneobert :
+            raise NotImplementedError
         if hidden_size % num_attention_heads != 0:
             raise ValueError("Hidden size must be divisible by the number of heads.")
-        self.dim_head = hidden_size // num_attention_heads
+        if pos_size % num_attention_heads != 0 :
+            raise ValueError("Pos size must be divisible by the number of heads.")
+        if rope and use_only_sem_for_decoding :
+            raise ValueError("Cannot use RoPE and use only semantic for decoding")
+        
+        self.hidden_size = hidden_size
+        self.pos_size = pos_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        
+        self.dim_head = ((hidden_size + pos_size) // num_attention_heads) if posneobert else hidden_size // num_attention_heads
+        self.pos_intermediate_size = pos_intermediate_size
         self.intermediate_size = intermediate_size
-        self.dropout = dropout
+        self.pos_dropout_prob = pos_dropout_prob
+        self.dropout_prob = dropout_prob
+        self.attention_probs_dropout_prob = attention_probs_dropout_prob
+        self.use_only_sem_for_decoding = use_only_sem_for_decoding
+        self.mixed_feed_forward = mixed_feed_forward
         self.embedding_init_range = embedding_init_range
         self.decoder_init_range = decoder_init_range
         self.rms_norm = rms_norm
         self.rope = rope
+        self.posneobert = posneobert
         self.norm_eps = norm_eps
         self.hidden_act = hidden_act
         self.vocab_size = vocab_size
@@ -75,6 +160,7 @@ class NeoBERTConfig(PretrainedConfig):
         self.flash_attention = flash_attention
         self.base_scale = base_scale
         self.ngpt = ngpt
+        self.positional_embed_init = positional_embed_init
         self.kwargs = kwargs
 
 
@@ -87,9 +173,20 @@ class EncoderBlock(nn.Module):
         self.config = config
 
         # Attention
-        self.qkv = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size * 3, bias=False)
-        self.wo = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
-        self.resid_dropout = nn.Dropout(config.dropout)
+        if not self.config.posneobert :
+            self.qkv = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size * 3, bias=False)
+            self.wo = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
+            self.resid_dropout = nn.Dropout(config.dropout_prob)
+        else :
+            self.qk = nn.Linear(in_features=config.hidden_size + config.pos_size, out_features=(config.hidden_size + config.pos_size) * 2, bias=False)
+            self.v_pos = nn.Linear(in_features=config.pos_size, out_features=config.pos_size, bias=False)
+            self.v_sem = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
+            self.wo_pos = nn.Linear(in_features=config.pos_size, out_features=config.pos_size, bias=False)
+            self.wo_sem = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
+            self.resid_dropout = nn.Dropout(config.dropout_prob)
+
+            self.sem_attention_head_size = int(config.hidden_size / config.num_attention_heads)
+            self.pos_attention_head_size = int(config.pos_size / config.num_attention_heads)
 
         # Feedforward network
         match config.hidden_act.lower():
@@ -98,28 +195,101 @@ class EncoderBlock(nn.Module):
                 # hidden units by a factor of 2/3 (https://arxiv.org/pdf/2002.05202.pdf) and make it a multiple of 8 to
                 # avoid RuntimeError due to misaligned operand
                 multiple_of = 8
-                intermediate_size = int(2 * config.intermediate_size / 3)
-                intermediate_size = multiple_of * ((intermediate_size + multiple_of - 1) // multiple_of)
-                self.ffn = SwiGLU(config.hidden_size, intermediate_size, config.hidden_size, bias=False)
+                if not self.config.posneobert :
+                    intermediate_size = int(2 * (config.intermediate_size) / 3)
+                    intermediate_size = multiple_of * ((intermediate_size + multiple_of - 1) // multiple_of)
+                    self.ffn = SwiGLU(config.hidden_size, intermediate_size, config.hidden_size, bias=False)
+                else :
+                    # FOR POSBERT
+                    if self.config.mixed_feed_forward :
+                        intermediate_size = int(2 * (config.pos_intermediate_size + config.intermediate_size) / 3)
+                        intermediate_size = multiple_of * ((intermediate_size + multiple_of - 1) // multiple_of)
+                        self.ffn = SwiGLU(config.hidden_size + config.pos_size, intermediate_size, config.hidden_size + config.pos_size, bias=False)
+                    else :
+                        pos_intermediate_size = int(2 * (config.pos_intermediate_size) / 3)
+                        pos_intermediate_size = multiple_of * ((pos_intermediate_size + multiple_of - 1) // multiple_of)
+                        self.pos_ffn = SwiGLU(config.pos_size, pos_intermediate_size, config.pos_size, bias=False)
+
+                        sem_intermediate_size = int(2 * (config.intermediate_size) / 3)
+                        sem_intermediate_size = multiple_of * ((sem_intermediate_size + multiple_of - 1) // multiple_of)
+                        self.sem_ffn = SwiGLU(config.hidden_size, sem_intermediate_size, config.hidden_size, bias=False)
+
             case "gelu":
-                self.ffn = nn.Sequential(
-                    nn.Linear(config.hidden_size, config.intermediate_size, bias=False),
-                    nn.GELU(),
-                    nn.Linear(config.intermediate_size, config.hidden_size, bias=False),
-                )
+                if not self.config.posneobert :
+                    self.ffn = nn.Sequential(
+                        nn.Linear(config.hidden_size, config.intermediate_size, bias=False),
+                        nn.GELU(),
+                        nn.Linear(config.intermediate_size, config.hidden_size, bias=False),
+                    )
+                else :
+                    # FOR POSBERT
+                    if self.config.mixed_feed_forward :
+                        self.ffn = nn.Sequential(
+                            nn.Linear(config.hidden_size + config.pos_size, config.intermediate_size + config.pos_intermediate_size, bias=False),
+                            nn.GELU(),
+                            nn.Linear(config.intermediate_size + config.pos_intermediate_size, config.hidden_size + config.pos_size, bias=False),
+                        )
+                    
+                    else :
+                        self.pos_ffn = nn.Sequential(
+                            nn.Linear(config.pos_size,config.pos_intermediate_size, bias=False),
+                            nn.GELU(),
+                            nn.Linear(config.pos_intermediate_size, config.pos_size, bias=False),
+                        )
 
-        self.attention_norm = (
-            RMSNorm(config.hidden_size, config.norm_eps) if config.rms_norm else nn.LayerNorm(config.hidden_size, config.norm_eps)
-        )
-        self.ffn_norm = (
-            RMSNorm(config.hidden_size, config.norm_eps) if config.rms_norm else nn.LayerNorm(config.hidden_size, config.norm_eps)
-        )
+                        self.sem_ffn = nn.Sequential(
+                            nn.Linear(config.hidden_size,config.intermediate_size, bias=False),
+                            nn.GELU(),
+                            nn.Linear(config.intermediate_size, config.hidden_size, bias=False),
+                        )
 
-        self.ffn_dropout = nn.Dropout(config.dropout)
+
+        # Pre-Layer Norm
+        if not self.config.posneobert :
+            self.attention_norm = (
+                RMSNorm(config.hidden_size, config.norm_eps) if config.rms_norm else nn.LayerNorm(config.hidden_size, config.norm_eps)
+            )
+            self.ffn_norm = (
+                RMSNorm(config.hidden_size, config.norm_eps) if config.rms_norm else nn.LayerNorm(config.hidden_size, config.norm_eps)
+            )
+        else :
+            # separate LayerNorm
+            self.sem_attention_norm = (
+                RMSNorm(config.hidden_size, config.norm_eps) if config.rms_norm else nn.LayerNorm(config.hidden_size, config.norm_eps)
+            )
+            self.sem_ffn_norm = (
+                RMSNorm(config.hidden_size, config.norm_eps) if config.rms_norm else nn.LayerNorm(config.hidden_size, config.norm_eps)
+            )
+            self.pos_attention_norm = (
+                RMSNorm(config.pos_size, config.norm_eps) if config.rms_norm else nn.LayerNorm(config.pos_size, config.norm_eps)
+            )
+            self.pos_ffn_norm = (
+                RMSNorm(config.pos_size, config.norm_eps) if config.rms_norm else nn.LayerNorm(config.pos_size, config.norm_eps)
+            )
+
+        
+        # FFN dropout
+        self.ffn_dropout = nn.Dropout(config.dropout_prob)
+
 
     def forward(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor):
-        x = x + self._att_block(self.attention_norm(x), pad_mask, freqs_cis)
-        x = x + self._ff_block(self.ffn_norm(x))
+        if self.config.posneobert :
+            #separated normalization
+            x_pos = self.pos_attention_norm(x[..., :self.config.pos_size])
+            x_sem = self.sem_attention_norm(x[..., self.config.pos_size:])
+            x = torch.cat([x_pos, x_sem], dim=-1)
+
+            x = x + self._posneobert_att_block(x=x, pad_mask=pad_mask, freqs_cis=freqs_cis)
+
+            x_pos = self.pos_ffn_norm(x[..., :self.config.pos_size])
+            x_sem = self.sem_ffn_norm(x[..., self.config.pos_size:])
+            x = torch.cat([x_pos, x_sem], dim=-1)
+
+            x = x + self._posneobert_ff_block(x)
+
+        else :
+            x = x + self._att_block(self.attention_norm(x), pad_mask, freqs_cis)
+            x = x + self._ff_block(self.ffn_norm(x))
         return x
 
     def _att_block(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor):
@@ -129,11 +299,12 @@ class EncoderBlock(nn.Module):
 
         if self.config.rope:
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
+        
 
         if self.config.flash_attention:
             attn = memory_efficient_attention(query=xq, key=xk, value=xv, attn_bias=pad_mask, p=0)
         else:
-            # Input and output are of dimension (B, H, M, K)
+            # Input and output are of dimension (B, H, M, K) (b_size, num_head, seqlength, h_dim)
             attn = scaled_dot_product_attention(
                 query=xq.transpose(1, 2),
                 key=xk.transpose(1, 2),
@@ -144,8 +315,55 @@ class EncoderBlock(nn.Module):
 
         return self.resid_dropout(self.wo(attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.config.dim_head)))
 
+    def _posneobert_att_block(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor):
+        batch_size, seq_len, _ = x.shape
+        
+        xq, xk = self.qk(x).view(batch_size, seq_len, self.config.num_attention_heads, self.config.dim_head * 2).chunk(2, axis=-1)
+        xv_pos = self.v_pos(x[..., :self.config.pos_size])
+        xv_sem = self.v_sem(x[..., self.config.pos_size:])
+
+        if self.config.flash_attention:
+            raise NotImplementedError
+            #doesnt work as is
+            # pos_attn = memory_efficient_attention(query=xq, key=xk, value=xv_pos, attn_bias=pad_mask, p=0) # (b_size, num_head, seqlength, pos_head_dim)
+            # sem_attn = memory_efficient_attention(query=xq, key=xk, value=xv_sem, attn_bias=pad_mask, p=0) # (b_size, num_head, seqlength, sem_head_dim)
+        else:
+            # #TODO => make sure, but it seems that the dropout is the same for pos and sem
+            
+            # Input are of dimension (B, H, M, K) (b_size, num_head, seqlength, h_dim)
+            # output are of dimension (B, H, M, M) (b_size, num_head, seqlength, seqlength)
+            attn_weight = posbert_scaled_dot_product_attention(
+                query=xq.transpose(1, 2),
+                key=xk.transpose(1, 2),
+                attn_mask=pad_mask,
+                dropout_p=self.config.pos_dropout_prob if self.training else 0,
+            )
+
+            xv_pos=xv_pos.reshape(batch_size, seq_len, self.config.num_attention_heads, self.pos_attention_head_size)
+            xv_sem=xv_sem.reshape(batch_size, seq_len, self.config.num_attention_heads, self.sem_attention_head_size)
+
+            pos_attn = (attn_weight @ xv_pos.transpose(1,2)).transpose(1, 2) # [b_size, seq_length, num_head, pos_size]
+            sem_attn = (attn_weight @ xv_sem.transpose(1,2)).transpose(1, 2) # [b_size, seq_length, num_head, sem_size]
+
+        pos_attn = self.wo_pos(pos_attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.pos_attention_head_size))
+        sem_attn = self.wo_sem(sem_attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.sem_attention_head_size))
+        attn = torch.cat([pos_attn, sem_attn], dim=-1)
+
+        return self.resid_dropout(attn)
+
     def _ff_block(self, x: torch.Tensor):
         return self.ffn_dropout(self.ffn(x))
+
+
+    def _posneobert_ff_block(self, x:torch.Tensor):
+        if self.config.mixed_feed_forward :
+            x = self.ffn(x)
+        else :
+            x_pos = self.pos_ffn(x[..., :self.config.pos_size])
+            x_sem = self.sem_ffn(x[..., self.config.pos_size:])
+            x = torch.cat([x_pos, x_sem], dim=-1)
+        return self.ffn_dropout(x)
+
 
 
 class NormEncoderBlock(nn.Module):
@@ -156,11 +374,27 @@ class NormEncoderBlock(nn.Module):
 
         self.config = config
 
-        # Attention
-        self.qkv = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size * 3, bias=False)
-        self.wo = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
-        self.resid_dropout = nn.Dropout(config.dropout)
+        self.attention_head_size = int((config.hidden_size + config.pos_size) / config.num_attention_heads)
+        self.sem_attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.pos_attention_head_size = int(config.pos_size / config.num_attention_heads)
 
+        self.all_head_size = config.num_attention_heads * self.attention_head_size
+        self.sem_all_head_size = config.num_attention_heads * self.sem_attention_head_size
+        self.pos_all_head_size = config.num_attention_heads * self.pos_attention_head_size
+
+        # Attention
+        if not self.config.posneobert :
+            self.qkv = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size * 3, bias=False)
+            self.wo = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
+            self.resid_dropout = nn.Dropout(config.dropout)
+        else :
+            self.qk = nn.Linear(in_features=config.hidden_size + config.pos_size, out_features=(config.hidden_size + config.pos_size) * 2, bias=False)
+            self.v_pos = nn.Linear(in_features=config.pos_size, out_features=config.pos_size, bias=False)
+            self.v_pos = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
+            self.pos_resid_dropout = nn.Dropout(config.pos_dropout_prob)
+            self.sem_resid_dropout = nn.Dropout(config.dropout_prob)
+
+        
         self.c_fc = nn.Linear(config.hidden_size, 2 * config.intermediate_size, bias=False)
         self.silu = nn.SiLU()
         self.mlp_c_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
@@ -256,6 +490,9 @@ class NeoBERTPreTrainedModel(PreTrainedModel):
     _supports_cache_class = True
 
     def _init_weights(self, module):
+        if getattr(module, "_skip_weight_init", False):
+            return  #  Skip this one
+
         if isinstance(module, nn.Linear):
             module.weight.data.uniform_(-self.config.decoder_init_range, self.config.decoder_init_range)
             if module.bias is not None:
@@ -276,6 +513,18 @@ class NeoBERT(NeoBERTPreTrainedModel):
 
         if self.config.rope:
             self.freqs_cis = precompute_freqs_cis(config.hidden_size // config.num_attention_heads, config.max_length)
+        elif self.config.posneobert:
+            match config.positional_embed_init :
+                case "random" :
+                    self.positional_embedding = nn.Embedding(config.max_length + 1, config.pos_size, padding_idx=config.pad_token_id)
+                case "2dim_cosine" :
+                    embs = torch.zeros((config.max_length + 1, config.pos_size))
+                    rows = torch.arange(config.max_length + 1, dtype=torch.float32)
+                    angles = math.pi * rows / config.max_length
+                    embs[:, :2] = torch.stack([torch.cos(angles), torch.sin(angles)], dim=1)
+                    self.positional_embedding = nn.Embedding.from_pretrained(embs, freeze=False)
+                    self.positional_embedding._skip_weight_init = True
+        
         else:
             self.positional_embedding = nn.Embedding(config.max_length + 1, config.hidden_size, padding_idx=config.pad_token_id)
 
@@ -283,12 +532,20 @@ class NeoBERT(NeoBERTPreTrainedModel):
         for _ in range(config.num_hidden_layers):
             self.transformer_encoder.append(EncoderBlock(config))
 
-        self.layer_norm = (
-            RMSNorm(config.hidden_size, config.norm_eps) if config.rms_norm else nn.LayerNorm(config.hidden_size, config.norm_eps)
-        )
-
+        if not self.config.posneobert :
+            self.layer_norm = (
+                RMSNorm(config.hidden_size, config.norm_eps) if config.rms_norm else nn.LayerNorm(config.hidden_size, config.norm_eps)
+            )
+        else :
+            self.sem_layer_norm = (
+                RMSNorm(config.hidden_size, config.norm_eps) if config.rms_norm else nn.LayerNorm(config.hidden_size, config.norm_eps)
+            )
+            self.pos_layer_norm = (
+                RMSNorm(config.pos_size, config.norm_eps) if config.rms_norm else nn.LayerNorm(config.pos_size, config.norm_eps)
+            )
         # Initialize weights and apply final processing
         self.post_init()
+
 
     def forward(self, src, pad_mask=None):
         # Expand and repeat: (Batch, Length) -> (Batch, Heads, Length, Length)
@@ -307,18 +564,30 @@ class NeoBERT(NeoBERTPreTrainedModel):
 
         # Positional embedding
         if not self.config.rope:
-            mask = src.ne(self.config.pad_token_id).int()
-            incremental_indices = (torch.cumsum(mask, dim=1).type_as(mask)) * mask  #
-            incremental_indices = incremental_indices.long() + self.config.pad_token_id
-            x += self.positional_embedding(incremental_indices)
+            if not self.config.posneobert :
+                mask = src.ne(self.config.pad_token_id).int()
+                incremental_indices = (torch.cumsum(mask, dim=1).type_as(mask)) * mask  #
+                incremental_indices = incremental_indices.long() + self.config.pad_token_id
+                x += self.positional_embedding(incremental_indices)
+            else :
+                mask = src.ne(self.config.pad_token_id).int()
+                incremental_indices = (torch.cumsum(mask, dim=1).type_as(mask)) * mask  #
+                incremental_indices = incremental_indices.long() + self.config.pad_token_id
+                positional_embed = self.positional_embedding(incremental_indices)
+                x = torch.concat([positional_embed, x], dim=-1)
 
         # Transformer encoder
         for layer in self.transformer_encoder:
             x = layer(x, pad_mask, freqs_cis)
 
         # Final normalization layer
-        x = self.layer_norm(x)
-
+        if not self.config.posneobert :
+            x = self.layer_norm(x)
+        else :
+            x_pos = self.pos_layer_norm(x[..., :self.config.pos_size])
+            x_sem = self.sem_layer_norm(x[..., self.config.pos_size:])
+            x = torch.cat([x_pos, x_sem], dim=-1)
+        
         # Return the output of the last hidden layer
         return x
 
@@ -396,13 +665,28 @@ class NeoBERTLMHead(NeoBERTPreTrainedModel):
         self.config = config
 
         self.model = NormNeoBERT(config) if self.config.ngpt else NeoBERT(config)
-        self.decoder = nn.Linear(config.hidden_size, config.vocab_size)
+
+        if not self.config.posneobert :
+            self.decoder = nn.Linear(config.hidden_size, config.vocab_size)
+
+        else :
+            if self.config.use_only_sem_for_decoding :
+                self.decoder = nn.Linear(config.hidden_size, config.vocab_size)
+            else :
+                self.decoder = nn.Linear(config.hidden_size + config.pos_size, config.vocab_size)
 
         self.post_init()
 
     def forward(self, src, pad_mask=None):
         hidden_representation = self.model.forward(src, pad_mask)
-        logits = self.decoder(hidden_representation)
+
+        if not self.config.posneobert :
+            logits = self.decoder(hidden_representation)
+        else :
+            if self.config.use_only_sem_for_decoding :
+                logits = self.decoder(hidden_representation[..., self.config.pos_size:])
+            else :
+                logits = self.decoder(hidden_representation)
 
         return {"hidden_representation": hidden_representation, "logits": logits}
 
@@ -649,3 +933,59 @@ class NeoBERTForMTEB(NeoBERTPreTrainedModel):
             encodings.append(outputs.cpu().numpy())
 
         return np.concatenate(encodings, axis=0)
+
+
+if __name__ == "__main__" :
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    # Test model
+    config = NeoBERTConfig(
+        hidden_size = 720,
+        pos_size=48,
+        num_hidden_layers = 12,
+        num_attention_heads = 12,
+        pos_intermediate_size=336,
+        intermediate_size=2880,
+        pos_dropout_prob=0.1,
+        dropout_prob=0.1,
+        attention_probs_dropout_prob=0.1,
+        use_only_sem_for_decoding = False,
+        mixed_feed_forward = False,
+        embedding_init_range = 0.02,
+        decoder_init_range = 0.02,
+        rms_norm = False,
+        rope = False,
+        posneobert = True,
+        norm_eps = 1e-06,
+        hidden_act = "SwiGLU",
+        vocab_size = tokenizer.vocab_size,
+        pad_token_id = 0,
+        max_length = 1024,
+        flash_attention = False,
+        base_scale = 1.0 / (960.0**0.5),
+        ngpt = False,
+        positional_embed_init = "2dim_cosine")
+    
+    print(config)
+    model = NeoBERTLMHead(config)
+
+    text = "This is a text, and this is a [MASK]."
+    input = tokenizer(text, return_tensors="pt")
+    print(input)
+    output = model(input["input_ids"])
+    print(output["logits"].shape)
+
+
+    # TEST DE DROPOUT
+    # emb = torch.rand((3,3))
+    # other1 = torch.rand((3,3))
+    # other2 = torch.rand((3,3))
+    # print(emb)
+    # dropout = nn.Dropout(0.2)
+    # emb = dropout(emb)
+    # print(emb)
+    # new = emb @ other1
+    # print(emb)
+    # new2 = emb @ other2

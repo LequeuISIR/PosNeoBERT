@@ -20,8 +20,8 @@ hydra:
 wandb:
   resume: never
   name: null
-  project: neo-bert
-  entity: sarath-chandar
+  project: posbert
+  entity: lequeu-sorbonne-universit-
   tags: []
   dir: logs/wandb
   mode: online

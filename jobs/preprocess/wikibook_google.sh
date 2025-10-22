@@ -8,16 +8,13 @@
 #SBATCH --cpus-per-task=32               # number of cpus per node
 #SBATCH --mem=256G                       # memory per node
 
-# Load python environment
-source activate base
-conda activate .venv
 
 # Launch the tokenization
-python $HOME/neo-bert/scripts/pretraining/preprocess.py \
+uv run $HOME/repos/PosNeoBERT/scripts/pretraining/preprocess.py \
     wandb.mode=disabled \
-    trainer.dir=$SCRATCH/logs/$SLURM_JOB_NAME \
-    hydra.run.dir=$SCRATCH/logs/$SLURM_JOB_NAME/hydra \
+    trainer.dir=$HOME/repos/PosNeoBERT/logs/$SLURM_JOB_NAME \
+    hydra.run.dir=$HOME/repos/PosNeoBERT/logs/$SLURM_JOB_NAME/hydra \
     tokenizer=google \
     tokenizer.max_length=512 \
     dataset=wikibook \
-    dataset.path_to_disk=$SCRATCH/tokenized_datasets/wikibook_google_512 \
+    dataset.path_to_disk=/data/lequeu/PosNeoBERT/tokenized_datasets/wikibook_google_512 \
