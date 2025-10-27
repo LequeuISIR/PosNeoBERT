@@ -251,6 +251,7 @@ class EncoderBlock(nn.Module):
 
 
     def forward(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor):
+        attn_weight = None
         if self.config.posneobert :
             #separated normalization
             # print("here is x", x)
@@ -267,6 +268,7 @@ class EncoderBlock(nn.Module):
             x_sem = self.sem_ffn_norm(x[..., self.config.pos_size:])
             x = torch.cat([x_pos, x_sem], dim=-1)
 
+            print("input of ff", x.shape)
             x = x + self._posneobert_ff_block(x)
             # print("x in forward", x)
 
@@ -339,6 +341,7 @@ class EncoderBlock(nn.Module):
         sem_attn = self.wo_sem(sem_attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.sem_attention_head_size))
         attn = torch.cat([pos_attn, sem_attn], dim=-1)
 
+        print("attention shape", attn.shape)
         return self.resid_dropout(attn), attn_weight
 
     def _ff_block(self, x: torch.Tensor):

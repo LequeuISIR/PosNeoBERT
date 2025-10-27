@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=realneobert
+#SBATCH --job-name=testneobert
 #SBATCH --time=48:00:00
 #SBATCH --partition=hard    
 #SBATCH --nodes=1                    # number of nodes
@@ -38,12 +38,13 @@ cmd=(
     --gradient_clipping=1.0 \
     $HOME/repos/PosNeoBERT/scripts/pretraining/pretrain.py \
     wandb.name=$SLURM_JOB_NAME \
+    wandb.mode=offline \
     wandb.dir=/data/lequeu/logs/$SLURM_JOB_NAME/wandb \
     trainer.dir=/data/lequeu/logs/$SLURM_JOB_NAME \
     hydra.run.dir=/data/lequeu/logs/$SLURM_JOB_NAME/hydra \
     dataset=wikibook \
     tokenizer=google \
-    model=[neobert] \
+    model=[posneobert] \
     datacollator=mlm_20 \
     optimizer=adamw \
     scheduler=cosine_decay \
