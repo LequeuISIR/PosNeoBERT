@@ -204,6 +204,7 @@ def trainer(cfg: DictConfig):
                 with accelerator.no_sync(model):
                     # Forward pass
                     logits = model(batch["input_ids"], batch.get("attention_mask", None))["logits"]
+                    # print("logits", logits)
                     train_loss = train_loss_fn(logits.view(-1, cfg.tokenizer.vocab_size), batch["labels"].view(-1))
 
                     # Compute gradient

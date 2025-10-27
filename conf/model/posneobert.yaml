@@ -11,6 +11,7 @@ classifier_init_range: 0.02
 pos_sem_mixed_feed_forward: true
 use_only_sem_for_decoding: true
 flash_attention: false
+positional_embed_init: 2dim_cosine
 num_hidden_layers: 12
 num_attention_heads : 12
 hidden_size: 720

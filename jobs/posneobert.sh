@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=neobert
+#SBATCH --job-name=realneobert
 #SBATCH --time=48:00:00
 #SBATCH --partition=hard    
 #SBATCH --nodes=1                    # number of nodes
@@ -43,7 +43,7 @@ cmd=(
     hydra.run.dir=/data/lequeu/logs/$SLURM_JOB_NAME/hydra \
     dataset=wikibook \
     tokenizer=google \
-    model=[posneobert] \
+    model=[neobert] \
     datacollator=mlm_20 \
     optimizer=adamw \
     scheduler=cosine_decay \

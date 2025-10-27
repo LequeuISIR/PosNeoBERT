@@ -10,7 +10,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-# from torch.nn.functional import scaled_dot_product_attention
+from torch.nn.functional import scaled_dot_product_attention
 
 from typing import Any, Dict, List, Optional
 from functools import partial
@@ -26,42 +26,12 @@ from tqdm import tqdm
 
 from .rmsnorm import RMSNorm
 from .rotary import precompute_freqs_cis, apply_rotary_emb
-
-
-# Efficient implementation equivalent to the following:
-def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
-        is_causal=False, scale=None, enable_gqa=False, output_attentions=False) -> torch.Tensor:
-    L, S = query.size(-2), key.size(-2)
-    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
-    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
-    if is_causal:
-        assert attn_mask is None
-        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
-        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
-
-    if attn_mask is not None:
-        if attn_mask.dtype == torch.bool:
-            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
-        else:
-            attn_bias = attn_mask + attn_bias
-
-    if enable_gqa:
-        key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
-        value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
-
-    attn_weight = query @ key.transpose(-2, -1) * scale_factor
-    attn_weight += attn_bias
-    
-
-    if output_attentions :
-        return attn_weight @ value, attn_weight
-        
-    return attn_weight @ value
+from .softpick import softpick
 
 
 # Efficient implementation equivalent to the following:
 def posbert_scaled_dot_product_attention(query, key, attn_mask=None, dropout_p=0.0,
-        is_causal=False, scale=None, enable_gqa=False) -> torch.Tensor:
+        is_causal=False, scale=None, enable_gqa=False, attention_activation = "softmax") -> torch.Tensor:
     L, S = query.size(-2), key.size(-2)
     scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
     attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
@@ -81,9 +51,15 @@ def posbert_scaled_dot_product_attention(query, key, attn_mask=None, dropout_p=0
 
     attn_weight = query @ key.transpose(-2, -1) * scale_factor
     attn_weight += attn_bias
-    attn_weight = torch.softmax(attn_weight, dim=-1)
-    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
     
+    if attention_activation == "softmax" :
+        attn_weight = torch.softmax(attn_weight, dim=-1)
+    elif attention_activation == "softpick" :
+        attn_weight = softpick(attn_weight, dim = -1)
+    else :
+        raise ValueError(f"attention activation {attention_activation} is not defined.")
+
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
         
     return attn_weight 
 
@@ -120,6 +96,7 @@ class NeoBERTConfig(PretrainedConfig):
         base_scale: float = 1.0 / (960.0**0.5),
         ngpt: bool = False,
         positional_embed_init: str = "random",
+        attention_activation: str = "softmax",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -161,6 +138,7 @@ class NeoBERTConfig(PretrainedConfig):
         self.base_scale = base_scale
         self.ngpt = ngpt
         self.positional_embed_init = positional_embed_init
+        self.attention_activation = attention_activation
         self.kwargs = kwargs
 
 
@@ -275,24 +253,33 @@ class EncoderBlock(nn.Module):
     def forward(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor):
         if self.config.posneobert :
             #separated normalization
+            # print("here is x", x)
+            # print("cut as", x[..., :self.config.pos_size])
+
             x_pos = self.pos_attention_norm(x[..., :self.config.pos_size])
             x_sem = self.sem_attention_norm(x[..., self.config.pos_size:])
             x = torch.cat([x_pos, x_sem], dim=-1)
-
-            x = x + self._posneobert_att_block(x=x, pad_mask=pad_mask, freqs_cis=freqs_cis)
+            
+            new_x, attn_weight = self._posneobert_att_block(x=x, pad_mask=pad_mask, freqs_cis=freqs_cis)
+            x = x + new_x
 
             x_pos = self.pos_ffn_norm(x[..., :self.config.pos_size])
             x_sem = self.sem_ffn_norm(x[..., self.config.pos_size:])
             x = torch.cat([x_pos, x_sem], dim=-1)
 
             x = x + self._posneobert_ff_block(x)
+            # print("x in forward", x)
 
         else :
             x = x + self._att_block(self.attention_norm(x), pad_mask, freqs_cis)
             x = x + self._ff_block(self.ffn_norm(x))
-        return x
+
+        return x, attn_weight
 
     def _att_block(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor):
+        if self.config.attention_activation == "softpick" :
+            raise NotImplementedError
+        
         batch_size, seq_len, _ = x.shape
 
         xq, xk, xv = self.qkv(x).view(batch_size, seq_len, self.config.num_attention_heads, self.config.dim_head * 3).chunk(3, axis=-1)
@@ -301,6 +288,7 @@ class EncoderBlock(nn.Module):
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
         
 
+        # print("xqxk", xq, xk)
         if self.config.flash_attention:
             attn = memory_efficient_attention(query=xq, key=xk, value=xv, attn_bias=pad_mask, p=0)
         else:
@@ -313,6 +301,7 @@ class EncoderBlock(nn.Module):
                 dropout_p=self.config.dropout_prob if self.training else 0,
             ).transpose(1, 2)
 
+        # print("attention", attn)
         return self.resid_dropout(self.wo(attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.config.dim_head)))
 
     def _posneobert_att_block(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor):
@@ -337,6 +326,7 @@ class EncoderBlock(nn.Module):
                 key=xk.transpose(1, 2),
                 attn_mask=pad_mask,
                 dropout_p=self.config.pos_dropout_prob if self.training else 0,
+                attention_activation = self.config.attention_activation
             )
 
             xv_pos=xv_pos.reshape(batch_size, seq_len, self.config.num_attention_heads, self.pos_attention_head_size)
@@ -349,7 +339,7 @@ class EncoderBlock(nn.Module):
         sem_attn = self.wo_sem(sem_attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.sem_attention_head_size))
         attn = torch.cat([pos_attn, sem_attn], dim=-1)
 
-        return self.resid_dropout(attn)
+        return self.resid_dropout(attn), attn_weight
 
     def _ff_block(self, x: torch.Tensor):
         return self.ffn_dropout(self.ffn(x))
@@ -549,6 +539,8 @@ class NeoBERT(NeoBERTPreTrainedModel):
 
     def forward(self, src, pad_mask=None):
         # Expand and repeat: (Batch, Length) -> (Batch, Heads, Length, Length)
+        all_attentions = []
+
         if pad_mask is not None:
             assert pad_mask.dtype != torch.bool and 1.0 not in pad_mask, "NeoBERT expects an additive pad_mask"
             pad_mask = pad_mask.unsqueeze(1).unsqueeze(1).repeat(1, self.config.num_attention_heads, pad_mask.size(-1), 1)
@@ -578,7 +570,10 @@ class NeoBERT(NeoBERTPreTrainedModel):
 
         # Transformer encoder
         for layer in self.transformer_encoder:
-            x = layer(x, pad_mask, freqs_cis)
+            # print("getting in x", x)
+            
+            x, attention = layer(x, pad_mask, freqs_cis)
+            all_attentions.append(attention)
 
         # Final normalization layer
         if not self.config.posneobert :
@@ -589,7 +584,7 @@ class NeoBERT(NeoBERTPreTrainedModel):
             x = torch.cat([x_pos, x_sem], dim=-1)
         
         # Return the output of the last hidden layer
-        return x
+        return x, all_attentions
 
 
 class NormNeoBERT(NeoBERTPreTrainedModel):
@@ -678,7 +673,8 @@ class NeoBERTLMHead(NeoBERTPreTrainedModel):
         self.post_init()
 
     def forward(self, src, pad_mask=None):
-        hidden_representation = self.model.forward(src, pad_mask)
+
+        hidden_representation, all_attentions = self.model.forward(src, pad_mask)
 
         if not self.config.posneobert :
             logits = self.decoder(hidden_representation)
@@ -688,8 +684,35 @@ class NeoBERTLMHead(NeoBERTPreTrainedModel):
             else :
                 logits = self.decoder(hidden_representation)
 
-        return {"hidden_representation": hidden_representation, "logits": logits}
+        return {"hidden_representation": hidden_representation, "logits": logits, "all_attentions": all_attentions}
 
+
+class PosOnlyNeoBERTLMHead(NeoBERTLMHead) :
+     
+    def load_state_dict(self, state_dict, strict=True, assign=False, layers=[], *model_args, **kwargs):
+
+        out = super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+        # Now modify the weights
+        with torch.no_grad():
+            for layer in layers:
+                self.model.transformer_encoder[layer].qk.weight[:, self.config.pos_size:] = 0
+
+        return out
+    
+
+class SemOnlyNeoBERTLMHead(NeoBERTLMHead) :
+
+    def load_state_dict(self, state_dict, strict=True, assign=False, layers=[], *model_args, **kwargs):
+
+        out = super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+        # Now modify the weights
+        with torch.no_grad():
+            for layer in layers:
+                self.model.transformer_encoder[layer].qk.weight[:, :self.config.pos_size] = 0
+
+        return out
 
 class NeoBERTForSequenceClassification(NeoBERTPreTrainedModel):
 
