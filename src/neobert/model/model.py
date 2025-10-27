@@ -51,15 +51,6 @@ def posbert_scaled_dot_product_attention(query, key, attn_mask=None, dropout_p=0
 
     attn_weight = query @ key.transpose(-2, -1) * scale_factor
     attn_weight += attn_bias
-    
-    if attention_activation == "softmax" :
-        attn_weight = torch.softmax(attn_weight, dim=-1)
-    elif attention_activation == "softpick" :
-        attn_weight = softpick(attn_weight, dim = -1)
-    else :
-        raise ValueError(f"attention activation {attention_activation} is not defined.")
-
-    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
         
     return attn_weight 
 
@@ -156,7 +147,8 @@ class EncoderBlock(nn.Module):
             self.wo = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
             self.resid_dropout = nn.Dropout(config.dropout_prob)
         else :
-            self.qk = nn.Linear(in_features=config.hidden_size + config.pos_size, out_features=(config.hidden_size + config.pos_size) * 2, bias=False)
+            self.qk_pos = nn.Linear(in_features=config.pos_size, out_features=(config.pos_size) * 2, bias=False)
+            self.qk_sem = nn.Linear(in_features=config.hidden_size, out_features=(config.hidden_size) * 2, bias=False)
             self.v_pos = nn.Linear(in_features=config.pos_size, out_features=config.pos_size, bias=False)
             self.v_sem = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
             self.wo_pos = nn.Linear(in_features=config.pos_size, out_features=config.pos_size, bias=False)
@@ -165,6 +157,11 @@ class EncoderBlock(nn.Module):
 
             self.sem_attention_head_size = int(config.hidden_size / config.num_attention_heads)
             self.pos_attention_head_size = int(config.pos_size / config.num_attention_heads)
+
+            self.theta_cls_out = nn.Parameter(torch.tensor(0.5))
+            self.theta_cls_in  = nn.Parameter(torch.tensor(0.5))
+            # self.theta_sep_out = nn.Parameter(torch.tensor(0.5))
+            # self.theta_sep_in  = nn.Parameter(torch.tensor(0.5))
 
         # Feedforward network
         match config.hidden_act.lower():
@@ -267,6 +264,7 @@ class EncoderBlock(nn.Module):
             x_sem = self.sem_ffn_norm(x[..., self.config.pos_size:])
             x = torch.cat([x_pos, x_sem], dim=-1)
 
+            print("input of ffblock", x.shape, x)
             x = x + self._posneobert_ff_block(x)
             # print("x in forward", x)
 
@@ -306,10 +304,15 @@ class EncoderBlock(nn.Module):
 
     def _posneobert_att_block(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor):
         batch_size, seq_len, _ = x.shape
+
+        print("x shape", x.shape)
         
-        xq, xk = self.qk(x).view(batch_size, seq_len, self.config.num_attention_heads, self.config.dim_head * 2).chunk(2, axis=-1)
+        xq_pos, xk_pos = self.qk_pos(x[..., :self.config.pos_size]).view(batch_size, seq_len, self.config.num_attention_heads, (self.config.pos_size // self.config.num_attention_heads) * 2).chunk(2, axis=-1)
+        xq_sem, xk_sem = self.qk_sem(x[..., self.config.pos_size:]).view(batch_size, seq_len, self.config.num_attention_heads, (self.config.hidden_size // self.config.num_attention_heads) * 2).chunk(2, axis=-1)
         xv_pos = self.v_pos(x[..., :self.config.pos_size])
         xv_sem = self.v_sem(x[..., self.config.pos_size:])
+
+        print("xqp, xkp, xqs, xks, xvp, xvs", xq_pos.shape, xk_pos.shape, xq_sem.shape, xk_sem.shape, xv_pos.shape, xv_sem.shape)
 
         if self.config.flash_attention:
             raise NotImplementedError
@@ -321,13 +324,48 @@ class EncoderBlock(nn.Module):
             
             # Input are of dimension (B, H, M, K) (b_size, num_head, seqlength, h_dim)
             # output are of dimension (B, H, M, M) (b_size, num_head, seqlength, seqlength)
-            attn_weight = posbert_scaled_dot_product_attention(
-                query=xq.transpose(1, 2),
-                key=xk.transpose(1, 2),
+            pos_attn_weight = posbert_scaled_dot_product_attention(
+                query=xq_pos.transpose(1, 2),
+                key=xk_pos.transpose(1, 2),
                 attn_mask=pad_mask,
                 dropout_p=self.config.pos_dropout_prob if self.training else 0,
                 attention_activation = self.config.attention_activation
             )
+
+            # pos_attn_weight = pos_attn_weight.clone()
+
+            # # CLS (always position 0)
+            # pos_attn_weight[:, :, 0, :] = self.theta_cls_out
+            # pos_attn_weight[:, :, :, 0] = self.theta_cls_in
+
+            #  # Find SEP index: last valid token before padding
+            # sep_indices = (pad_mask.sum(dim=1) - 1).to(dtype=torch.long, device=pos_attn_weight.device)  # [batch]
+            # batch_indices = torch.arange(batch_size, device=pos_attn_weight.device, dtype=torch.long)
+            # head_idx = torch.arange(pos_attn_weight.shape[1], device=pos_attn_weight.device, dtype=torch.long)
+
+            # pos_attn_weight[batch_indices[:, None], head_idx[None, :], sep_indices[:, None], :] = self.theta_sep_out
+            # pos_attn_weight[batch_indices[:, None], head_idx[None, :], :, sep_indices[:, None]] = self.theta_sep_in
+
+
+            sem_attn_weight = posbert_scaled_dot_product_attention(
+                query=xq_sem.transpose(1, 2),
+                key=xk_sem.transpose(1, 2),
+                attn_mask=pad_mask,
+                # dropout_p=self.config.pos_dropout_prob if self.training else 0,
+                # attention_activation = self.config.attention_activation
+            )
+
+            attn_weight = pos_attn_weight +  sem_attn_weight
+
+            if self.config.attention_activation == "softmax" :
+                attn_weight = torch.softmax(attn_weight, dim=-1)
+            elif self.config.attention_activation == "softpick" :
+                attn_weight = softpick(attn_weight, dim = -1).to(xq_sem.dtype)
+            else :
+                raise ValueError(f"attention activation {self.config.attention_activation} is not defined.")
+
+            print("attention weight", attn_weight.shape, attn_weight)
+            attn_weight = torch.dropout(attn_weight, self.config.pos_dropout_prob if self.training else 0, train=True)
 
             xv_pos=xv_pos.reshape(batch_size, seq_len, self.config.num_attention_heads, self.pos_attention_head_size)
             xv_sem=xv_sem.reshape(batch_size, seq_len, self.config.num_attention_heads, self.sem_attention_head_size)
@@ -338,6 +376,8 @@ class EncoderBlock(nn.Module):
         pos_attn = self.wo_pos(pos_attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.pos_attention_head_size))
         sem_attn = self.wo_sem(sem_attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.sem_attention_head_size))
         attn = torch.cat([pos_attn, sem_attn], dim=-1)
+
+        print("final attn", attn.shape, attn)
 
         return self.resid_dropout(attn), attn_weight
 
