@@ -29,7 +29,6 @@ from .rotary import precompute_freqs_cis, apply_rotary_emb
 from .softpick import softpick
 
 
-# Efficient implementation equivalent to the following:
 def posbert_scaled_dot_product_attention(query, key, attn_mask=None, dropout_p=0.0,
         is_causal=False, scale=None, enable_gqa=False, attention_activation = "softmax") -> torch.Tensor:
     L, S = query.size(-2), key.size(-2)
@@ -88,6 +87,9 @@ class NeoBERTConfig(PretrainedConfig):
         ngpt: bool = False,
         positional_embed_init: str = "random",
         attention_activation: str = "softmax",
+        mix_attentions: str = "sum",
+        untie_cls: bool = False,
+
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -100,7 +102,19 @@ class NeoBERTConfig(PretrainedConfig):
         if pos_size % num_attention_heads != 0 :
             raise ValueError("Pos size must be divisible by the number of heads.")
         if rope and use_only_sem_for_decoding :
-            raise ValueError("Cannot use RoPE and use only semantic for decoding")
+            raise ValueError("Cannot use RoPE and use only semantic for decoding.")
+        if rope and positional_embed_init == "2dim_cosine" :
+            raise ValueError("Cannot use RoPE and setup positional embeds.")
+        if rope and mix_attentions == "hadamard" :
+            raise ValueError("Cannot setup mix attentions with RoPE.")
+        
+        if positional_embed_init not in ["random", "2dim_cosine"] :
+            raise ValueError
+        if attention_activation not in ["softmax", "softpick"] :
+            raise ValueError
+        if mix_attentions not in ["sum", "hadamard"] :
+            raise ValueError
+
         
         self.hidden_size = hidden_size
         self.pos_size = pos_size
@@ -130,6 +144,8 @@ class NeoBERTConfig(PretrainedConfig):
         self.ngpt = ngpt
         self.positional_embed_init = positional_embed_init
         self.attention_activation = attention_activation
+        self.untie_cls = untie_cls
+        self.mix_attentions = mix_attentions
         self.kwargs = kwargs
 
 
@@ -154,12 +170,15 @@ class EncoderBlock(nn.Module):
             self.wo_pos = nn.Linear(in_features=config.pos_size, out_features=config.pos_size, bias=False)
             self.wo_sem = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
             self.resid_dropout = nn.Dropout(config.dropout_prob)
+            self.attn_activation_fct = torch.softmax if self.config.attention_activation == "softmax" else softpick
+            # self.mix_fct = torch.mul if self.config.mix_attentions == "hadamard" else torch.add
 
             self.sem_attention_head_size = int(config.hidden_size / config.num_attention_heads)
             self.pos_attention_head_size = int(config.pos_size / config.num_attention_heads)
 
-            self.theta_cls_out = nn.Parameter(torch.tensor(0.5))
-            self.theta_cls_in  = nn.Parameter(torch.tensor(0.5))
+            if self.config.untie_cls :
+                self.register_parameter("theta_cls_out", nn.Parameter(torch.tensor(0.05)))
+                self.register_parameter("theta_cls_in",  nn.Parameter(torch.tensor(0.05)))
             # self.theta_sep_out = nn.Parameter(torch.tensor(0.5))
             # self.theta_sep_in  = nn.Parameter(torch.tensor(0.5))
 
@@ -248,6 +267,7 @@ class EncoderBlock(nn.Module):
 
 
     def forward(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor):
+        attn_weight = None
         if self.config.posneobert :
             #separated normalization
             # print("here is x", x)
@@ -262,9 +282,9 @@ class EncoderBlock(nn.Module):
 
             x_pos = self.pos_ffn_norm(x[..., :self.config.pos_size])
             x_sem = self.sem_ffn_norm(x[..., self.config.pos_size:])
-            x = torch.cat([x_pos, x_sem], dim=-1)
+            x = torch.cat([x_pos, x_sem], dim=-1).contiguous()
 
-            print("input of ffblock", x.shape, x)
+            # print("input of ffblock", x.shape)
             x = x + self._posneobert_ff_block(x)
             # print("x in forward", x)
 
@@ -305,14 +325,14 @@ class EncoderBlock(nn.Module):
     def _posneobert_att_block(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor):
         batch_size, seq_len, _ = x.shape
 
-        print("x shape", x.shape)
+        # print("x shape", x.shape)
         
         xq_pos, xk_pos = self.qk_pos(x[..., :self.config.pos_size]).view(batch_size, seq_len, self.config.num_attention_heads, (self.config.pos_size // self.config.num_attention_heads) * 2).chunk(2, axis=-1)
         xq_sem, xk_sem = self.qk_sem(x[..., self.config.pos_size:]).view(batch_size, seq_len, self.config.num_attention_heads, (self.config.hidden_size // self.config.num_attention_heads) * 2).chunk(2, axis=-1)
         xv_pos = self.v_pos(x[..., :self.config.pos_size])
         xv_sem = self.v_sem(x[..., self.config.pos_size:])
 
-        print("xqp, xkp, xqs, xks, xvp, xvs", xq_pos.shape, xk_pos.shape, xq_sem.shape, xk_sem.shape, xv_pos.shape, xv_sem.shape)
+        # print("xqp, xkp, xqs, xks, xvp, xvs", xq_pos.shape, xk_pos.shape, xq_sem.shape, xk_sem.shape, xv_pos.shape, xv_sem.shape)
 
         if self.config.flash_attention:
             raise NotImplementedError
@@ -332,12 +352,17 @@ class EncoderBlock(nn.Module):
                 attention_activation = self.config.attention_activation
             )
 
-            # pos_attn_weight = pos_attn_weight.clone()
+            if self.config.untie_cls :
+                theta_cls_out = self.theta_cls_out.to(pos_attn_weight.dtype).to(pos_attn_weight.device)
+                theta_cls_in  = self.theta_cls_in.to(pos_attn_weight.dtype).to(pos_attn_weight.device)
 
-            # # CLS (always position 0)
-            # pos_attn_weight[:, :, 0, :] = self.theta_cls_out
-            # pos_attn_weight[:, :, :, 0] = self.theta_cls_in
+                pos_attn_weight = pos_attn_weight.clone()
 
+                # # CLS (always position 0)
+                pos_attn_weight[:, :, 0, :] = theta_cls_out
+                pos_attn_weight[:, :, :, 0] = theta_cls_in
+
+            # print(pos_attn_weight)
             #  # Find SEP index: last valid token before padding
             # sep_indices = (pad_mask.sum(dim=1) - 1).to(dtype=torch.long, device=pos_attn_weight.device)  # [batch]
             # batch_indices = torch.arange(batch_size, device=pos_attn_weight.device, dtype=torch.long)
@@ -354,31 +379,53 @@ class EncoderBlock(nn.Module):
                 # dropout_p=self.config.pos_dropout_prob if self.training else 0,
                 # attention_activation = self.config.attention_activation
             )
+            if self.config.mix_attentions == "sum" :
+                attn_weight = torch.add(pos_attn_weight,sem_attn_weight)
+                attn_weight = self.attn_activation_fct(attn_weight,  dim=-1).to(xq_sem.dtype)
 
-            attn_weight = pos_attn_weight +  sem_attn_weight
+            elif self.config.mix_attentions == "hadamard" :
+                pos_logp = torch.log_softmax(pos_attn_weight, dim=-1)
+                sem_logp = torch.log_softmax(sem_attn_weight, dim=-1)
+                attn_weight = self.attn_activation_fct(pos_logp + sem_logp, dim=-1).to(xq_sem.dtype)
 
-            if self.config.attention_activation == "softmax" :
-                attn_weight = torch.softmax(attn_weight, dim=-1)
-            elif self.config.attention_activation == "softpick" :
-                attn_weight = softpick(attn_weight, dim = -1).to(xq_sem.dtype)
-            else :
-                raise ValueError(f"attention activation {self.config.attention_activation} is not defined.")
+                # mask = (pad_mask < 0)
+                # pos_attn_safe = pos_attn_weight.masked_fill(mask, 0.0)
+                # sem_attn_safe = sem_attn_weight.masked_fill(mask, 0.0)
+                # attn_weight = torch.mul(pos_attn_safe, sem_attn_safe)
+                # attn_weight = attn_weight.masked_fill(mask, float('-inf'))
 
-            print("attention weight", attn_weight.shape, attn_weight)
+
+            # print("attn weights", attn_weight)
+
+            # if self.config.attention_activation == "softmax" :
+            #     attn_weight = torch.softmax(attn_weight, dim=-1)
+            # elif self.config.attention_activation == "softpick" :
+            #     attn_weight = softpick(attn_weight, dim = -1).to(xq_sem.dtype)
+
+
+            # print("after softpick", attn_weight)
+            # print("attention weight", attn_weight.shape)
             attn_weight = torch.dropout(attn_weight, self.config.pos_dropout_prob if self.training else 0, train=True)
 
-            xv_pos=xv_pos.reshape(batch_size, seq_len, self.config.num_attention_heads, self.pos_attention_head_size)
-            xv_sem=xv_sem.reshape(batch_size, seq_len, self.config.num_attention_heads, self.sem_attention_head_size)
+            xv_pos = xv_pos.reshape(batch_size, seq_len, self.config.num_attention_heads, self.pos_attention_head_size)
+            xv_sem = xv_sem.reshape(batch_size, seq_len, self.config.num_attention_heads, self.sem_attention_head_size)
 
             pos_attn = (attn_weight @ xv_pos.transpose(1,2)).transpose(1, 2) # [b_size, seq_length, num_head, pos_size]
             sem_attn = (attn_weight @ xv_sem.transpose(1,2)).transpose(1, 2) # [b_size, seq_length, num_head, sem_size]
 
+            # print("pos dtype, contig, strides:", pos_attn_weight.dtype, pos_attn_weight.is_contiguous(), pos_attn_weight.stride())
+            # print("sem dtype, contig, strides:", sem_attn_weight.dtype, sem_attn_weight.is_contiguous(), sem_attn_weight.stride())
+            # print("pos ptr:", pos_attn_weight.data_ptr() % 16)
+            # print("sem ptr:", sem_attn_weight.data_ptr() % 16)
+            # print("head sizes:", self.pos_attention_head_size, self.sem_attention_head_size)
+
         pos_attn = self.wo_pos(pos_attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.pos_attention_head_size))
         sem_attn = self.wo_sem(sem_attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.sem_attention_head_size))
-        attn = torch.cat([pos_attn, sem_attn], dim=-1)
+        attn = torch.cat([pos_attn, sem_attn], dim=-1).to(x.dtype).contiguous()
+        # print("attn dtype, contig, strides:", attn.dtype, attn.is_contiguous(), attn.stride())
 
-        print("final attn", attn.shape, attn)
-
+        # print("final attn", attn.shape)
+        # print("attn at the end", attn)
         return self.resid_dropout(attn), attn_weight
 
     def _ff_block(self, x: torch.Tensor):
@@ -387,7 +434,7 @@ class EncoderBlock(nn.Module):
 
     def _posneobert_ff_block(self, x:torch.Tensor):
         if self.config.mixed_feed_forward :
-            x = self.ffn(x)
+            x = self.ffn(x.contiguous())
         else :
             x_pos = self.pos_ffn(x[..., :self.config.pos_size])
             x_sem = self.sem_ffn(x[..., self.config.pos_size:])
@@ -580,7 +627,7 @@ class NeoBERT(NeoBERTPreTrainedModel):
     def forward(self, src, pad_mask=None):
         # Expand and repeat: (Batch, Length) -> (Batch, Heads, Length, Length)
         all_attentions = []
-
+        all_hidden_states = []
         if pad_mask is not None:
             assert pad_mask.dtype != torch.bool and 1.0 not in pad_mask, "NeoBERT expects an additive pad_mask"
             pad_mask = pad_mask.unsqueeze(1).unsqueeze(1).repeat(1, self.config.num_attention_heads, pad_mask.size(-1), 1)
@@ -613,6 +660,7 @@ class NeoBERT(NeoBERTPreTrainedModel):
             # print("getting in x", x)
             
             x, attention = layer(x, pad_mask, freqs_cis)
+            all_hidden_states.append(x)
             all_attentions.append(attention)
 
         # Final normalization layer
@@ -624,7 +672,7 @@ class NeoBERT(NeoBERTPreTrainedModel):
             x = torch.cat([x_pos, x_sem], dim=-1)
         
         # Return the output of the last hidden layer
-        return x, all_attentions
+        return x, all_attentions, all_hidden_states
 
 
 class NormNeoBERT(NeoBERTPreTrainedModel):
@@ -714,7 +762,7 @@ class NeoBERTLMHead(NeoBERTPreTrainedModel):
 
     def forward(self, src, pad_mask=None):
 
-        hidden_representation, all_attentions = self.model.forward(src, pad_mask)
+        hidden_representation, all_attentions, all_hidden_states = self.model.forward(src, pad_mask)
 
         if not self.config.posneobert :
             logits = self.decoder(hidden_representation)
@@ -724,7 +772,7 @@ class NeoBERTLMHead(NeoBERTPreTrainedModel):
             else :
                 logits = self.decoder(hidden_representation)
 
-        return {"hidden_representation": hidden_representation, "logits": logits, "all_attentions": all_attentions}
+        return {"hidden_representation": hidden_representation, "logits": logits, "all_attentions": all_attentions, "all_hidden_states": all_hidden_states}
 
 
 class PosOnlyNeoBERTLMHead(NeoBERTLMHead) :

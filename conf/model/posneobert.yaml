@@ -1,7 +1,7 @@
 rope: false
 posneobert: true
 rms_norm: True
-hidden_act: swiglu
+hidden_act: gelu
 dropout_prob: 0.1
 pos_dropout_prob: 0
 norm_eps: 1e-05
@@ -16,4 +16,6 @@ num_hidden_layers: 12
 num_attention_heads : 12
 hidden_size: 720
 pos_size: 48
-attention_ativation: softmax
+attention_ativation: softpick
+untie_cls: false
+mix_attentions: hadamard

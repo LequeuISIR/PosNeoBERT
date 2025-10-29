@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=softpick-neobert
+#SBATCH --job-name=random-hadamard-untie-softpick-PosNeoBERT
 #SBATCH --time=48:00:00
 #SBATCH --partition=hard    
 #SBATCH --nodes=1                    # number of nodes
 #SBATCH --ntasks-per-node=1             # crucial - only 1 task per node!
-#SBATCH --gpus-per-task=3              # number of gpus per node
+#SBATCH --gpus-per-task=2           # number of gpus per node
 #SBATCH --cpus-per-task=16           # number of cpus per nod
 #SBATCH --mem=32G
 #SBATCH --output=logs/%x-%j.out
@@ -39,11 +39,15 @@ cmd=(
     $HOME/repos/PosNeoBERT/scripts/pretraining/pretrain.py \
     wandb.name=$SLURM_JOB_NAME \
     wandb.dir=/data/lequeu/logs/$SLURM_JOB_NAME/wandb \
+    wandb.mode=online \
     trainer.dir=/data/lequeu/logs/$SLURM_JOB_NAME \
     hydra.run.dir=/data/lequeu/logs/$SLURM_JOB_NAME/hydra \
     dataset=wikibook \
     tokenizer=google \
     model=[posneobert] \
+    model.positional_embed_init=random \
+    model.mix_attentions=hadamard \
+    model.untie_cls=true \
     datacollator=mlm_20 \
     optimizer=adamw \
     scheduler=cosine_decay \
