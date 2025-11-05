@@ -26,7 +26,7 @@ from ..tokenizer import get_tokenizer
 from ..optimizer import get_optimizer
 from ..scheduler import get_scheduler
 from ..dataloader import get_dataloader
-
+from .entropy_regularization import compute_head_entropy
 
 def to_target_batch_size(
     batch: BatchEncoding,
@@ -203,14 +203,35 @@ def trainer(cfg: DictConfig):
             if metrics["train/batches"] % cfg.trainer.gradient_accumulation_steps != 0:
                 with accelerator.no_sync(model):
                     # Forward pass
-                    logits = model(batch["input_ids"], batch.get("attention_mask", None))["logits"]
+                    output = model(batch["input_ids"], batch.get("attention_mask", None))
+
+                    logits = output["logits"]
+                    
                     # print("logits", logits)
                     train_loss = train_loss_fn(logits.view(-1, cfg.tokenizer.vocab_size), batch["labels"].view(-1))
 
-                    # Compute gradient
-                    accelerator.backward(train_loss)
+                    metrics["train/CEL"] = train_loss.item()
+
+                    entropy_loss = 0
+                    if cfg.trainer.entropy_regularization_lambda > 0 :
+                        all_pos_sem_attentions = output["all_pos_sem_attentions"] # listlayer, listpossem, [batch_size, num heads, seqlen, seqlen]
+                        
+                        for pos, sem in all_pos_sem_attentions :
+                            reg = (1 - compute_head_entropy(sem.half())/torch.log(torch.tensor(2 * sem.size(-1) - 1))) * compute_head_entropy(pos.half())
+                            entropy_loss += reg.sum()
+                        
+                        metrics["train/local_sum_entropy_reg"] += entropy_loss.item() * batch["input_ids"].shape[0]
+
+                    
+
+                    
+                    total_loss = train_loss + cfg.trainer.entropy_regularization_lambda * entropy_loss
+
+                    accelerator.backward(total_loss)
+
 
                     # Log metrics
+                    metrics["train/local_total_loss"]  += total_loss.item() * batch["input_ids"].shape[0]
                     metrics["train/local_samples"] += batch["input_ids"].shape[0]
                     if "attention_mask" in batch.keys():
                         metrics["train/local_tokens"] += (batch["attention_mask"] == 0).sum().item()
@@ -222,16 +243,32 @@ def trainer(cfg: DictConfig):
 
             else:
                 # Forward pass
-                logits = model(batch["input_ids"], batch.get("attention_mask", None))["logits"]
-                train_loss = train_loss_fn(logits.view(-1, cfg.tokenizer.vocab_size), batch["labels"].view(-1))
+                output = model(batch["input_ids"], batch.get("attention_mask", None))
 
-                # Compute gradient and apply clipping
-                accelerator.backward(train_loss)
-                if cfg.trainer.gradient_clipping is not None and cfg.trainer.gradient_clipping > 0:
-                    accelerator.clip_grad_norm_(model.parameters(), cfg.trainer.gradient_clipping)
+                logits = output["logits"]
+                    
+                train_loss = train_loss_fn(logits.view(-1, cfg.tokenizer.vocab_size), batch["labels"].view(-1))
+                
+                entropy_loss = 0
+                if cfg.trainer.entropy_regularization_lambda > 0 :
+                    all_pos_sem_attentions = output["all_pos_sem_attentions"] # listlayer, listpossem, [batch_size, num heads, seqlen, seqlen]
+                    
+                    for pos, sem in all_pos_sem_attentions :
+                        reg = (1 - compute_head_entropy(sem.half())/torch.log(torch.tensor(2 * sem.size(-1) - 1))) * compute_head_entropy(pos.half())
+                        entropy_loss += reg.sum()
+
+                    metrics["train/local_sum_entropy_reg"] += entropy_loss.item() * batch["input_ids"].shape[0]
+                
+
+                total_loss = train_loss + cfg.trainer.entropy_regularization_lambda * entropy_loss
+
+                # print(train_loss, entropy_loss, cfg.trainer.entropy_regularization_lambda * entropy_loss, total_loss)
+
+                accelerator.backward(total_loss)
+
 
                 # Log metrics
-                pbar.update(1)
+                metrics["train/total_loss"] += total_loss.item()
                 metrics["train/steps"] += 1
                 metrics["train/local_samples"] += batch["input_ids"].shape[0]
                 if "attention_mask" in batch.keys():

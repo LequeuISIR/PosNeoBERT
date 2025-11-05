@@ -11,3 +11,4 @@ def softpick(x, dim=-1, eps=1e-8):
     r_x_e_1 = F.relu(x_e_1)
     a_x_e_1 = torch.where(x.isfinite(), torch.abs(x_e_1), 0)
     return r_x_e_1 / (torch.sum(a_x_e_1, dim=dim, keepdim=True) + eps) # epsilon is only useful if all inputs are EXACTLY 0. we might not even need it
+
