@@ -1,3 +1,6 @@
 name: wikibook
 column: text
 path_to_disk: /data/lequeu/PosNeoBERT/tokenized_datasets/wikibook_google_512/
+train:
+  bookcorpus_path: /data/bookcorpus
+  wikipedia_path: /data/wikipedia

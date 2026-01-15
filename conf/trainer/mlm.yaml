@@ -5,6 +5,7 @@ disable_tqdm: False
 max_steps: 1000000
 gradient_accumulation_steps: 1
 gradient_clipping: 1
+entropy_regularization_lambda: 0
 accelerate:
   save_steps: 1000
   max_ckpt: 5
