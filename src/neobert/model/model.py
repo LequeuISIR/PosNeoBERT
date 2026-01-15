@@ -120,6 +120,7 @@ class NeoBERTConfig(PretrainedConfig):
         mix_attentions: str = "sum",
         untie_cls: bool = False,
         random_offset = False,
+        shared_pos_keys = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -135,6 +136,8 @@ class NeoBERTConfig(PretrainedConfig):
             raise ValueError("Cannot use RoPE and use only semantic for decoding.")
         if rope and positional_embed_init == "2dim_cosine" :
             raise ValueError("Cannot use RoPE and setup positional embeds.")
+        if rope and shared_pos_keys :
+            raise ValueError("Cannot use RoPE and shared positional embeddings.")
         if rope and mix_attentions == "hadamard" :
             raise ValueError("Cannot setup mix attentions with RoPE.")
         
@@ -177,6 +180,7 @@ class NeoBERTConfig(PretrainedConfig):
         self.untie_cls = untie_cls
         self.mix_attentions = mix_attentions
         self.random_offset = random_offset
+        self.shared_pos_keys = shared_pos_keys
         self.kwargs = kwargs
 
 
@@ -194,7 +198,10 @@ class EncoderBlock(nn.Module):
             self.wo = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
             self.resid_dropout = nn.Dropout(config.dropout_prob)
         else :
-            self.qk_pos = nn.Linear(in_features=config.pos_size, out_features=(config.hidden_size + config.pos_size) * 2, bias=False)
+            if self.config.shared_pos_keys :
+                self.q_pos = nn.Linear(in_features=config.pos_size, out_features=(config.hidden_size + config.pos_size), bias=False)
+            else : 
+                self.qk_pos = nn.Linear(in_features=config.pos_size, out_features=(config.hidden_size + config.pos_size) * 2, bias=False)
             self.qk_sem = nn.Linear(in_features=config.hidden_size, out_features=(config.hidden_size + config.pos_size) * 2, bias=False)
             self.v_pos = nn.Linear(in_features=config.pos_size, out_features=config.pos_size, bias=False)
             self.v_sem = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
@@ -299,7 +306,7 @@ class EncoderBlock(nn.Module):
         self.ffn_dropout = nn.Dropout(config.dropout_prob)
 
 
-    def forward(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor):
+    def forward(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor, shared_pos_keys: torch.Tensor | None = None):
         attn_weight = None
         pos_sem_weights = None
         if self.config.posneobert :
@@ -311,7 +318,7 @@ class EncoderBlock(nn.Module):
             x_sem = self.sem_attention_norm(x[..., self.config.pos_size:])
             x = torch.cat([x_pos, x_sem], dim=-1)
             
-            new_x, attn_weight, pos_sem_weights = self._posneobert_att_block(x=x, pad_mask=pad_mask, freqs_cis=freqs_cis)
+            new_x, attn_weight, pos_sem_weights = self._posneobert_att_block(x=x, pad_mask=pad_mask, freqs_cis=freqs_cis, shared_pos_keys = shared_pos_keys)
             x = x + new_x
 
             x_pos = self.pos_ffn_norm(x[..., :self.config.pos_size])
@@ -358,12 +365,15 @@ class EncoderBlock(nn.Module):
         # print("attention", attn)
         return self.resid_dropout(self.wo(attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.config.dim_head)))
 
-    def _posneobert_att_block(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor):
+    def _posneobert_att_block(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor, shared_pos_keys: torch.Tensor | None = None):
         batch_size, seq_len, _ = x.shape
 
         # print("x shape", x.shape)
-        
-        xq_pos, xk_pos = self.qk_pos(x[..., :self.config.pos_size]).view(batch_size, seq_len, self.config.num_attention_heads, ((self.config.pos_size + self.config.hidden_size) // self.config.num_attention_heads) * 2).chunk(2, axis=-1)
+        if self.config.shared_pos_keys :
+            xq_pos = self.q_pos(x[..., :self.config.pos_size]).view(batch_size, seq_len, self.config.num_attention_heads, ((self.config.pos_size + self.config.hidden_size) // self.config.num_attention_heads))
+            xk_pos = shared_pos_keys.view(batch_size, seq_len, self.config.num_attention_heads, ((self.config.pos_size + self.config.hidden_size) // self.config.num_attention_heads))
+        else :
+            xq_pos, xk_pos = self.qk_pos(x[..., :self.config.pos_size]).view(batch_size, seq_len, self.config.num_attention_heads, ((self.config.pos_size + self.config.hidden_size) // self.config.num_attention_heads) * 2).chunk(2, axis=-1)
         xq_sem, xk_sem = self.qk_sem(x[..., self.config.pos_size:]).view(batch_size, seq_len, self.config.num_attention_heads, ((self.config.pos_size + self.config.hidden_size) // self.config.num_attention_heads) * 2).chunk(2, axis=-1)
         xv_pos = self.v_pos(x[..., :self.config.pos_size])
         xv_sem = self.v_sem(x[..., self.config.pos_size:])
@@ -590,6 +600,7 @@ class NeoBERT(NeoBERTPreTrainedModel):
         self.config = config
 
         self.encoder = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
+        self.shared_pos_encoder = nn.Linear(in_features=config.pos_size, out_features=(config.hidden_size + config.pos_size)) if config.shared_pos_keys else None
 
         if self.config.rope:
             self.freqs_cis = precompute_freqs_cis(config.hidden_size // config.num_attention_heads, config.max_length)
@@ -672,10 +683,12 @@ class NeoBERT(NeoBERTPreTrainedModel):
                 x = torch.concat([positional_embed, x], dim=-1)
 
         # Transformer encoder
+
+        shared_pos_keys = self.shared_pos_encoder(positional_embed) if self.config.shared_pos_keys else None
         for layer in self.transformer_encoder:
             # print("getting in x", x)
             
-            x, attention, pos_sem_attentions = layer(x, pad_mask, freqs_cis)
+            x, attention, pos_sem_attentions = layer(x, pad_mask, freqs_cis, shared_pos_keys = shared_pos_keys)
             all_hidden_states.append(x)
             all_attentions.append(attention)
             all_pos_sem_attentions.append(pos_sem_attentions)

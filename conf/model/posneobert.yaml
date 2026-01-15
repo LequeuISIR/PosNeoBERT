@@ -20,3 +20,4 @@ attention_ativation: softpick
 untie_cls: false
 mix_attentions: sum
 random_offset: true
+shared_pos_keys: false
