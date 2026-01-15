@@ -37,6 +37,14 @@ class Metrics(defaultdict):
             metrics_log["train/loss"] = metrics_agg["train/local_sum_loss"] / metrics_agg["train/local_num_pred"]
             metrics_log["train/perplexity"] = math.exp(metrics_log["train/loss"])
             metrics_log["train/accuracy"] = metrics_agg["train/local_num_correct"] / metrics_agg["train/local_num_pred"]
+            
+            if metrics_agg["train/local_samples"] > 0 and "train/local_sum_entropy_reg" in metrics_agg:
+                metrics_log["train/entropy_regularization"] = (
+                    metrics_agg["train/local_sum_entropy_reg"] / metrics_agg["train/local_samples"]
+                )
+                metrics_log["train/total_loss"] = (
+                    metrics_agg["train/local_total_loss"] / metrics_agg["train/local_samples"]
+                )
 
         # Log the metrics
         accelerator.log(metrics_log)

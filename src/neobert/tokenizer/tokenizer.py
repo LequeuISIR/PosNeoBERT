@@ -23,7 +23,7 @@ def get_tokenizer(
         trust_remote_code=True,
     )
 
-    if pretrained_model_name_or_path != "google-bert/bert-base-uncased":
+    if  "bert-base-uncased" not in pretrained_model_name_or_path:
         # Define special tokens to be consistent with RoBERTa
         special_tokens = {
             "bos_token": "<s>",
@@ -50,15 +50,19 @@ def get_tokenizer(
 
     return tokenizer
 
+import random
 
 def single_column_mapping(x, tokenizer, column_name, max_length, truncation):
-    return tokenizer(
+    # Tokenize normally (no padding yet)
+    out = tokenizer(
         x[column_name],
         truncation=truncation,
         max_length=max_length,
-        padding=False,  # no padding saves time and memory
+        padding=False,  # we'll pad manually
         return_token_type_ids=False,
     )
+    return out
+
 
 
 def multi_column_mapping(x, tokenizer, column_name, max_length, truncation):
@@ -133,6 +137,7 @@ def tokenize(
         num_proc=num_proc,
         remove_columns=columns_to_remove,
         features=features,
+        load_from_cache_file=False
     )
 
     return dataset

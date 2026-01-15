@@ -19,14 +19,16 @@ def preprocess(cfg: DictConfig):
         wiki = load_dataset("wikipedia", "20220301.en", split="train")
         wiki = wiki.remove_columns([col for col in wiki.column_names if col != "text"])
 
-        assert bookcorpus.features.type == wiki.features.type
+        print(bookcorpus)
+        
+        assert bookcorpus.features.type == wiki.features.type, f"{bookcorpus.features.type} and {wiki.features.type}"
         dataset = concatenate_datasets([bookcorpus, wiki])
         dataset = dataset.shuffle(seed=0)
     else:
         dataset = load_dataset(**cfg.dataset.train)
 
     print("Tokenizing dataset")
-    dataset = tokenize(dataset, tokenizer, column_name=cfg.dataset.column, **cfg.tokenizer)
+    dataset = tokenize(dataset, tokenizer, column_name=cfg.dataset.column, max_left_padding=200, **cfg.tokenizer)
 
     # Save the tokenized dataset to disk
     print("Saving tokenized dataset")
