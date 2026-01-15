@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=entropy-cosine-untie-softpick-swiglu-PosNeoBERT
+#SBATCH --job-name=entropy-cos-untie-softpick-swiglu-PosNeoBERT
 #SBATCH --time=48:00:00
 #SBATCH --partition=hard   
 #SBATCH --exclude=top 

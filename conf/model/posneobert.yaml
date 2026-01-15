@@ -18,5 +18,5 @@ hidden_size: 720
 pos_size: 48
 attention_ativation: softpick
 untie_cls: false
-mix_attentions: hadamard
+mix_attentions: sum
 random_offset: true

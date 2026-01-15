@@ -6,6 +6,7 @@ __all__ = [
     "NeoBERTConfig",
     "PosOnlyNeoBERTLMHead",
     "SemOnlyNeoBERTLMHead"
+    "softpick"
     # "NomicBERTForSequenceClassification",
 ]
 
@@ -19,3 +20,5 @@ from .model import (
     SemOnlyNeoBERTLMHead
     # NomicBERTForSequenceClassification,
 )
+
+from .softpick import softpick
