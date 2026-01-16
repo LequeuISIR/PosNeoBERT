@@ -371,7 +371,7 @@ class EncoderBlock(nn.Module):
         # print("x shape", x.shape)
         if self.config.shared_pos_keys :
             xq_pos = self.q_pos(x[..., :self.config.pos_size]).view(batch_size, seq_len, self.config.num_attention_heads, ((self.config.pos_size + self.config.hidden_size) // self.config.num_attention_heads))
-            xk_pos = shared_pos_keys.view(batch_size, seq_len, self.config.num_attention_heads, ((self.config.pos_size + self.config.hidden_size) // self.config.num_attention_heads))
+            xk_pos = shared_pos_keys # is of shape [bs, sk, nh, hs] already, where all heads have the same data.
         else :
             xq_pos, xk_pos = self.qk_pos(x[..., :self.config.pos_size]).view(batch_size, seq_len, self.config.num_attention_heads, ((self.config.pos_size + self.config.hidden_size) // self.config.num_attention_heads) * 2).chunk(2, axis=-1)
         xq_sem, xk_sem = self.qk_sem(x[..., self.config.pos_size:]).view(batch_size, seq_len, self.config.num_attention_heads, ((self.config.pos_size + self.config.hidden_size) // self.config.num_attention_heads) * 2).chunk(2, axis=-1)
@@ -600,7 +600,7 @@ class NeoBERT(NeoBERTPreTrainedModel):
         self.config = config
 
         self.encoder = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        self.shared_pos_encoder = nn.Linear(in_features=config.pos_size, out_features=(config.hidden_size + config.pos_size)) if config.shared_pos_keys else None
+        self.shared_pos_encoder = nn.Linear(in_features=config.pos_size, out_features=(config.hidden_size + config.pos_size) // config.num_attention_heads) if config.shared_pos_keys else None
 
         if self.config.rope:
             self.freqs_cis = precompute_freqs_cis(config.hidden_size // config.num_attention_heads, config.max_length)
@@ -684,7 +684,7 @@ class NeoBERT(NeoBERTPreTrainedModel):
 
         # Transformer encoder
 
-        shared_pos_keys = self.shared_pos_encoder(positional_embed) if self.config.shared_pos_keys else None
+        shared_pos_keys = self.shared_pos_encoder(positional_embed).unsqueeze(2).expand(-1, -1, self.config.num_attention_heads, -1) if self.config.shared_pos_keys else None
         for layer in self.transformer_encoder:
             # print("getting in x", x)
             

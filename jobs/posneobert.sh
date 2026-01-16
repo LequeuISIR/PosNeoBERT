@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=entropy-cos-untie-softpick-swiglu-PosNeoBERT
+#SBATCH --job-name=sharedkey_posneobert
 #SBATCH --time=48:00:00
 #SBATCH --partition=hard   
 #SBATCH --exclude=top 
@@ -42,7 +42,6 @@ cmd=(
     wandb.name=$SLURM_JOB_NAME \
     wandb.mode=offline \
     wandb.dir=/data/lequeu/logs/$SLURM_JOB_NAME/wandb \
-    wandb.mode=offline \
     trainer.dir=/data/lequeu/logs/$SLURM_JOB_NAME \
     trainer.entropy_regularization_lambda=0.01 \
     hydra.run.dir=/data/lequeu/logs/$SLURM_JOB_NAME/hydra \
@@ -56,6 +55,7 @@ cmd=(
     model.attention_ativation=softpick \
     model.hidden_act=swiglu \
     model.random_offset=true \
+    model.shared_pos_keys=true \
     datacollator=mlm_20 \
     optimizer=adamw \
     scheduler=cosine_decay \
