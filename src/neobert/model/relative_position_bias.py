@@ -92,11 +92,9 @@ class RelativePositionBucketedBias(nn.Module):
     def forward(self, seq_len):
         # Create distance grid: (seq_len_q, seq_len_k)
         if seq_len == self.bucket_indices.shape[0]:
-            print(2)
             bucket_indices = self.bucket_indices
         else:
             # Fallback to dynamic computation if length changes (e.g., during eval)
-            print(1)
             grid_q = torch.arange(seq_len, dtype=torch.long, device=self.relative_attention_bias.device).view(-1, 1)
             grid_k = torch.arange(seq_len, dtype=torch.long, device=self.relative_attention_bias.device).view(1, -1)
             relative_position = grid_k - grid_q
@@ -105,10 +103,7 @@ class RelativePositionBucketedBias(nn.Module):
             bucket_indices = self._relative_position_bucket(
                 relative_position, num_buckets=self.num_buckets, max_distance=self.max_distance
             )
-        
-
-        print(bucket_indices[10])
-        
+                
         # Look up biases: (seq_len_q, seq_len_k, num_heads)
         values = self.relative_attention_bias[bucket_indices, :]
         # Permute to (num_heads, seq_len, seq_len) for attention sum
