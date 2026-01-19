@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=sharedkey_posneobert
-#SBATCH --time=48:00:00
+#SBATCH --time=2:00:00
 #SBATCH --partition=hard   
 #SBATCH --exclude=top 
 #SBATCH --nodes=1                    # number of nodes
@@ -56,6 +56,7 @@ cmd=(
     model.hidden_act=swiglu \
     model.random_offset=true \
     model.shared_pos_keys=true \
+    model.relative_pos_bias=true \
     datacollator=mlm_20 \
     optimizer=adamw \
     scheduler=cosine_decay \

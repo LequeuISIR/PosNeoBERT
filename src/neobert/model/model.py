@@ -28,7 +28,7 @@ from .rmsnorm import RMSNorm
 from .rotary import precompute_freqs_cis, apply_rotary_emb
 from .softpick import softpick
 from .override_CLS_SEP import CLSSEPAttentionReplacer
-
+from .relative_position_bias import RelativePositionBucketedBias
 
 # Efficient implementation equivalent to the following:
 def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
@@ -121,6 +121,7 @@ class NeoBERTConfig(PretrainedConfig):
         untie_cls: bool = False,
         random_offset = False,
         shared_pos_keys = False,
+        relative_pos_bias = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -135,9 +136,11 @@ class NeoBERTConfig(PretrainedConfig):
         if rope and use_only_sem_for_decoding :
             raise ValueError("Cannot use RoPE and use only semantic for decoding.")
         if rope and positional_embed_init == "2dim_cosine" :
-            raise ValueError("Cannot use RoPE and setup positional embeds.")
+            raise ValueError("Cannot use RoPE and setup positional embeddings.")
         if rope and shared_pos_keys :
             raise ValueError("Cannot use RoPE and shared positional embeddings.")
+        if rope and relative_pos_bias :
+            raise ValueError("Cannot use RoPE and relative positional bias.")
         if rope and mix_attentions == "hadamard" :
             raise ValueError("Cannot setup mix attentions with RoPE.")
         
@@ -181,6 +184,7 @@ class NeoBERTConfig(PretrainedConfig):
         self.mix_attentions = mix_attentions
         self.random_offset = random_offset
         self.shared_pos_keys = shared_pos_keys
+        self.relative_pos_bias = relative_pos_bias
         self.kwargs = kwargs
 
 
@@ -202,6 +206,13 @@ class EncoderBlock(nn.Module):
                 self.q_pos = nn.Linear(in_features=config.pos_size, out_features=(config.hidden_size + config.pos_size), bias=False)
             else : 
                 self.qk_pos = nn.Linear(in_features=config.pos_size, out_features=(config.hidden_size + config.pos_size) * 2, bias=False)
+            
+            if self.config.relative_pos_bias :
+                self.relative_pos_bias = RelativePositionBucketedBias(num_heads=self.config.num_attention_heads, 
+                                                                      max_seq_len=self.config.max_length,
+                                                                      num_buckets=32,
+                                                                      max_distance=128)
+
             self.qk_sem = nn.Linear(in_features=config.hidden_size, out_features=(config.hidden_size + config.pos_size) * 2, bias=False)
             self.v_pos = nn.Linear(in_features=config.pos_size, out_features=config.pos_size, bias=False)
             self.v_sem = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
@@ -378,6 +389,9 @@ class EncoderBlock(nn.Module):
         xv_pos = self.v_pos(x[..., :self.config.pos_size])
         xv_sem = self.v_sem(x[..., self.config.pos_size:])
 
+        if self.config.relative_pos_bias :
+            pos_bias = self.relative_pos_bias(seq_len)
+
         # print("xqp, xkp, xqs, xks, xvp, xvs", xq_pos.shape, xk_pos.shape, xq_sem.shape, xk_sem.shape, xv_pos.shape, xv_sem.shape)
 
         if self.config.flash_attention:
@@ -412,14 +426,21 @@ class EncoderBlock(nn.Module):
 
         if self.config.mix_attentions == "sum" :
             attn_weight = torch.add(pos_attn_weight,sem_attn_weight)
+            if self.config.relative_pos_bias :
+                attn_weight = torch.add(attn_weight,pos_bias)
             attn_weight = self.attn_activation_fct(attn_weight,  dim=-1).to(xq_sem.dtype)
         elif self.config.mix_attentions == "hadamard" :
-            pos_p = torch.softmax(pos_attn_weight, dim=-1)
-            sem_p = torch.softmax(sem_attn_weight, dim=-1)
-            attn_weight = self.attn_activation_fct(pos_p*sem_p, dim=-1).to(xq_sem.dtype)
+            raise NotImplementedError
+            # pos_p = torch.softmax(pos_attn_weight, dim=-1)
+            # sem_p = torch.softmax(sem_attn_weight, dim=-1)
+            # if self.config.relative_pos_bias :
+            #     attn_weight = self.attn_activation_fct(pos_p*sem_p + pos_bias, dim=-1).to(xq_sem.dtype)
+            # else :
+            #     attn_weight = self.attn_activation_fct(pos_p*sem_p, dim=-1).to(xq_sem.dtype)
 
             # print("after softpick", attn_weight)
             # print("attention weight", attn_weight.shape)
+
         attn_weight = torch.dropout(attn_weight, self.config.pos_dropout_prob if self.training else 0, train=True)
 
         xv_pos = xv_pos.reshape(batch_size, seq_len, self.config.num_attention_heads, self.pos_attention_head_size)

@@ -21,3 +21,4 @@ untie_cls: false
 mix_attentions: sum
 random_offset: true
 shared_pos_keys: false
+relative_pos_bias: false

@@ -256,7 +256,7 @@ def trainer(cfg: DictConfig):
                         all_pos_sem_attentions = output["all_pos_sem_attentions"] # listlayer, listpossem, [batch_size, num heads, seqlen, seqlen]
                         
                         for pos, sem in all_pos_sem_attentions :
-                            reg = (1 - compute_head_entropy(sem)/torch.log(torch.tensor(2 * sem.size(-1) - 1))) * compute_head_entropy(pos)
+                            reg = (1 - compute_head_entropy(sem)/torch.log(torch.tensor(2 * sem.size(-1) - 1))).detach() * compute_head_entropy(pos)
                             entropy_loss += reg.sum()
                             #print(entropy_loss)
                         
