@@ -304,7 +304,8 @@ def trainer(cfg: DictConfig):
     # Preprocessing the datasets
     mapping = partial(process_function, tokenizer=tokenizer, cfg=cfg)
     with accelerator.main_process_first():
-        cache_file_names = {split: os.environ["HF_DATASETS_CACHE"] for split in ["train", "validation", "test"]}
+        os.makedirs(f"""{os.environ["HF_DATASETS_CACHE"]}/{cfg.task}""", exist_ok=True)
+        cache_file_names = {split: f"""{os.environ["HF_DATASETS_CACHE"]}/{cfg.task}/{split}""" for split in ["train", "validation", "test"]}
         processed_datasets = raw_datasets.map(
             mapping,
             batched=True,

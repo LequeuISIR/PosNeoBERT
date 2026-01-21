@@ -24,8 +24,8 @@ hydra:
 
 wandb:
   name: neobert-mnli
-  project: neo-bert_glue
-  entity: sarath-chandar
+  project: finetune-posbert
+  entity: lequeu-sorbonne-universit-
   tags: ["finetuning"]
   dir: null
   mode: offline

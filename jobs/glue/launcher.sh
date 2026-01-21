@@ -82,7 +82,7 @@ D=()
 # fi
 
 if [[ $meta_task=="glue" ]]; then
-    for task in 'stsb' ; do
+    for task in 'mrpc' 'rte' 'qnli' 'mnli' 'cola' 'sst2' 'qqp' 'mnli' ; do
         for batch_size in 16 ; do
             for lr in  2e-5 ; do
                 for wd in 0.01 ; do

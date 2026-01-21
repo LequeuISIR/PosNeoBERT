@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=glue-detach-PosNeoBERT
-#SBATCH --time=10:00:00
-#SBATCH -C a100
-#SBATCH -A npl@a100
-#SBATCH --qos qos_gpu_a100-t3
+#SBATCH --time=0:30:00
+#SBATCH -C h100
+#SBATCH -A znb@h100
+#SBATCH --qos qos_gpu_h100-dev
 #SBATCH --nodes=1                    # number of nodes
 #SBATCH --ntasks-per-node=1             # crucial - only 1 task per node!
 #SBATCH --gpus-per-task=1           # number of gpus per node
-#SBATCH --cpus-per-task=8           # number of cpus per nod
+#SBATCH --cpus-per-task=24           # number of cpus per nod
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
