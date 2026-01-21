@@ -43,12 +43,12 @@ class CLSSEPAttentionReplacer(nn.Module):
         theta_sep_in_exp  = self.theta_sep_in.view(1,H,1).expand(B,H,L)
 
         # Replace rows
-        out[batch_idx, head_idx, cls_idx, :] = theta_cls_out_exp
-        out[batch_idx, head_idx, sep_idx, :] = theta_sep_out_exp
+        out[batch_idx, head_idx, cls_idx, :] = theta_cls_out_exp.to(out.dtype)
+        out[batch_idx, head_idx, sep_idx, :] = theta_sep_out_exp.to(out.dtype)
 
         # Replace columns
-        out[batch_idx, head_idx, :, cls_idx] = theta_cls_in_exp
-        out[batch_idx, head_idx, :, sep_idx] = theta_sep_in_exp
+        out[batch_idx, head_idx, :, cls_idx] = theta_cls_in_exp.to(out.dtype)
+        out[batch_idx, head_idx, :, sep_idx] = theta_sep_in_exp.to(out.dtype)
 
         # # --- Replace CLS rows (source -> others) ---
         # theta_cls_out_exp = self.theta_cls_out.view(1,H,1).expand(B,H,L)

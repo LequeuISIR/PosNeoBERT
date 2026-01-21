@@ -389,8 +389,7 @@ class EncoderBlock(nn.Module):
         xv_pos = self.v_pos(x[..., :self.config.pos_size])
         xv_sem = self.v_sem(x[..., self.config.pos_size:])
 
-        if self.config.relative_pos_bias :
-            pos_bias = self.relative_pos_bias(seq_len)
+        pos_bias = self.relative_pos_bias(seq_len) if self.config.relative_pos_bias else None # (batch_size, num_heads, seq_len, seq_len) or None
 
         # print("xqp, xkp, xqs, xks, xvp, xvs", xq_pos.shape, xk_pos.shape, xq_sem.shape, xk_sem.shape, xv_pos.shape, xv_sem.shape)
 
@@ -429,6 +428,7 @@ class EncoderBlock(nn.Module):
             if self.config.relative_pos_bias :
                 attn_weight = torch.add(attn_weight,pos_bias)
             attn_weight = self.attn_activation_fct(attn_weight,  dim=-1).to(xq_sem.dtype)
+
         elif self.config.mix_attentions == "hadamard" :
             raise NotImplementedError
             # pos_p = torch.softmax(pos_attn_weight, dim=-1)
@@ -453,7 +453,7 @@ class EncoderBlock(nn.Module):
         sem_attn = self.wo_sem(sem_attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.sem_attention_head_size))
         attn = torch.cat([pos_attn, sem_attn], dim=-1).to(x.dtype).contiguous()
 
-        return self.resid_dropout(attn), attn_weight, [pos_attn_weight, sem_attn_weight]
+        return self.resid_dropout(attn), attn_weight, [pos_attn_weight, sem_attn_weight, pos_bias]
 
     def _ff_block(self, x: torch.Tensor):
         return self.ffn_dropout(self.ffn(x))
@@ -876,10 +876,11 @@ class NeoBERTForSequenceClassification(NeoBERTPreTrainedModel):
         self.classifier_init_range = classifier_init_range
 
         self.model = NeoBERT(config)
-
-        self.dense = nn.Linear(self.config.hidden_size, self.config.hidden_size)
+        
+        s_size = self.config.hidden_size if self.config.use_only_sem_for_decoding else self.config.hidden_size + self.config.pos_size
+        self.dense = nn.Linear(s_size, s_size)
         self.dropout = nn.Dropout(self.classifier_dropout)
-        self.classifier = nn.Linear(self.config.hidden_size, self.num_labels)
+        self.classifier = nn.Linear(s_size, self.num_labels)
 
         self.post_init()
 
@@ -893,6 +894,9 @@ class NeoBERTForSequenceClassification(NeoBERTPreTrainedModel):
         hidden_representation, _, _, _ = self.model.forward(src, pad_mask)
 
         x = hidden_representation[:, 0, :]
+        if self.config.use_only_sem_for_decoding :
+                x = x[..., self.config.pos_size:]
+        
         x = self.dropout(x)
         x = self.dense(x)
         x = torch.tanh(x)

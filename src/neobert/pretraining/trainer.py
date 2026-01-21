@@ -253,9 +253,11 @@ def trainer(cfg: DictConfig):
 
                     entropy_loss = 0
                     if cfg.trainer.entropy_regularization_lambda > 0 :
-                        all_pos_sem_attentions = output["all_pos_sem_attentions"] # listlayer, listpossem, [batch_size, num heads, seqlen, seqlen]
+                        all_pos_sem_attentions = output["all_pos_sem_attentions"] # listlayer, listpos/sem, [batch_size, num heads, seqlen, seqlen]
                         
-                        for pos, sem in all_pos_sem_attentions :
+                        for pos, sem, bias in all_pos_sem_attentions :
+                            if bias: 
+                                pos = torch.add(pos, bias)
                             reg = (1 - compute_head_entropy(sem)/torch.log(torch.tensor(2 * sem.size(-1) - 1))).detach() * compute_head_entropy(pos)
                             entropy_loss += reg.sum()
                             #print(entropy_loss)
@@ -295,7 +297,9 @@ def trainer(cfg: DictConfig):
                 if cfg.trainer.entropy_regularization_lambda > 0 :
                     all_pos_sem_attentions = output["all_pos_sem_attentions"] # listlayer, listpossem, [batch_size, num heads, seqlen, seqlen]
                     
-                    for pos, sem in all_pos_sem_attentions :
+                    for pos, sem, bias in all_pos_sem_attentions :
+                        if bias: 
+                            pos = torch.add(pos, bias)
                         reg = (1 - compute_head_entropy(sem)/torch.log(torch.tensor(2 * sem.size(-1) - 1))).detach() * compute_head_entropy(pos)
                         entropy_loss += reg.sum()
                         #print(entropy_loss)
