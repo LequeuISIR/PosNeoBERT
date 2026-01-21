@@ -890,7 +890,7 @@ class NeoBERTForSequenceClassification(NeoBERTPreTrainedModel):
                 module.bias.data.zero_()
 
     def forward(self, src, pad_mask=None):
-        hidden_representation = self.model.forward(src, pad_mask)
+        hidden_representation, _, _, _ = self.model.forward(src, pad_mask)
 
         x = hidden_representation[:, 0, :]
         x = self.dropout(x)
@@ -942,7 +942,7 @@ class NeoBERTHFForSequenceClassification(NeoBERTPreTrainedModel):
         return_dict: Optional[bool] = None,
     ):
 
-        hidden_representation = self.model.forward(input_ids, attention_mask)
+        hidden_representation, _, _, _  = self.model.forward(input_ids, attention_mask)
 
         x = hidden_representation[:, 0, :]
         x = self.dropout(x)

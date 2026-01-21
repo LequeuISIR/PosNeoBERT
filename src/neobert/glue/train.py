@@ -14,7 +14,7 @@ from torch.nn import CrossEntropyLoss, MSELoss
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed, ProjectConfiguration, DistributedType
-from datasets import load_dataset, ClassLabel
+from datasets import load_dataset, ClassLabel, load_from_disk
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from functools import partial
@@ -32,7 +32,7 @@ from transformers import (
 )
 from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
 
-from neobert.model import NeoBERTForSequenceClassification, NeoBERTConfig, NomicBERTForSequenceClassification
+from neobert.model import NeoBERTForSequenceClassification, NeoBERTConfig #, NomicBERTForSequenceClassification
 from neobert.tokenizer import get_tokenizer
 from .process import process_function
 from ..dataloader import get_dataloader
@@ -256,15 +256,15 @@ def trainer(cfg: DictConfig):
     if cfg.task in ("multirc", "record"):
         metric = evaluate.load("accuracy", experiment_id=cfg.id)
     elif cfg.task == "snli":
-        metric = evaluate.load(cfg.meta_task, "mnli", experiment_id=cfg.id)
+        metric = evaluate.load("src/neobert/glue/evaluate_glue.py", "mnli", experiment_id=cfg.id)
     elif cfg.task == "allnli":
-        metric = evaluate.load(cfg.meta_task, "wnli", experiment_id=cfg.id)
+        metric = evaluate.load("src/neobert/glue/evaluate_glue.py", "wnli", experiment_id=cfg.id)
     else:
-        metric = evaluate.load(cfg.meta_task, cfg.task, experiment_id=cfg.id)
+        metric = evaluate.load("src/neobert/glue/evaluate_glue.py", cfg.task, experiment_id=cfg.id)
 
     # Load additional metric for the mismatched validation set of mnli
     if cfg.task == "mnli":
-        mm_metric = evaluate.load(cfg.meta_task, "mnli_mismatched", experiment_id=cfg.id)
+        mm_metric = evaluate.load("src/neobert/glue/evaluate_glue.py", "mnli_mismatched", experiment_id=cfg.id)
 
     # def compute_metrics(p: EvalPrediction):
     #     preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
@@ -277,9 +277,10 @@ def trainer(cfg: DictConfig):
     # Loading the dataset
     print("Loading dataset...")
     if cfg.task == "snli":
-        raw_datasets = load_dataset("stanfordnlp/snli")
+        raw_datasets = load_from_disk("/lustre/fsmisc/dataset/HuggingFace/snli/plain_text")
         raw_datasets = raw_datasets.filter(lambda example: example["label"] != -1)
     elif cfg.task == "allnli":
+        raise NotImplementedError
         raw_datasets = load_dataset("sentence-transformers/all-nli", name="pair-class")
 
         def collapse_classes(examples):
@@ -289,8 +290,9 @@ def trainer(cfg: DictConfig):
         raw_datasets.map(collapse_classes, batched=True, desc="Collapsing classes into entailment and not entailment.")
 
     elif cfg.meta_task == "glue":
-        raw_datasets = load_dataset("glue", cfg.task)
+        raw_datasets = load_from_disk(f"/lustre/fsmisc/dataset/HuggingFace/glue/{cfg.task}")
     else:
+        raise NotImplementedError
         raw_datasets = load_dataset("json", data_dir=os.path.join(os.environ["HF_DATASETS_CACHE"], "super_glue", cfg.task))
 
     # Split between train and validation for datasets that don't have it natively
@@ -302,11 +304,13 @@ def trainer(cfg: DictConfig):
     # Preprocessing the datasets
     mapping = partial(process_function, tokenizer=tokenizer, cfg=cfg)
     with accelerator.main_process_first():
+        cache_file_names = {split: os.environ["HF_DATASETS_CACHE"] for split in ["train", "validation", "test"]}
         processed_datasets = raw_datasets.map(
             mapping,
             batched=True,
             remove_columns=raw_datasets["train"].column_names,
             desc="Preprocessing the dataset",
+            cache_file_names=cache_file_names
         )
 
     is_regression = cfg.task == "stsb"
@@ -363,21 +367,22 @@ def trainer(cfg: DictConfig):
             trust_remote_code=True,
         )
         if "nomic" in cfg.model.name:
-            base_model = AutoModelForMaskedLM.from_pretrained(
-                cfg.model.name,
-                from_tf=False,
-                config=config,
-                revision="main",
-                trust_remote_code=True,
-                ignore_mismatched_sizes=False,
-            )
-            model = NomicBERTForSequenceClassification(
-                config,
-                base_model.bert,
-                num_labels=num_labels,
-                classifier_dropout=cfg.model.classifier_dropout,
-                classifier_init_range=cfg.model.classifier_init_range,
-            )
+            raise NotImplementedError
+            # base_model = AutoModelForMaskedLM.from_pretrained(
+            #     cfg.model.name,
+            #     from_tf=False,
+            #     config=config,
+            #     revision="main",
+            #     trust_remote_code=True,
+            #     ignore_mismatched_sizes=False,
+            # )
+            # model = NomicBERTForSequenceClassification(
+            #     config,
+            #     base_model.bert,
+            #     num_labels=num_labels,
+            #     classifier_dropout=cfg.model.classifier_dropout,
+            #     classifier_init_range=cfg.model.classifier_init_range,
+            # )
         else:
             model = AutoModelForSequenceClassification.from_pretrained(
                 cfg.model.name,

@@ -16,7 +16,7 @@ from transformers import BatchEncoding
 from accelerate import Accelerator
 from accelerate.utils import DistributedType, ProjectConfiguration, set_seed
 from accelerate.utils import DistributedDataParallelKwargs
-from datasets import Features, Sequence, Value
+from datasets import Features, Sequence, Value, IterableDataset
 
 # Deepspeed
 from deepspeed.utils import safe_get_full_fp32_param
@@ -24,7 +24,7 @@ from deepspeed.utils import safe_get_full_fp32_param
 # Our metric object and model
 from .metrics import Metrics
 from ..model import NeoBERTLMHead, NeoBERTConfig
-from ..tokenizer import get_tokenizer 
+from ..tokenizer import get_tokenizer
 from ..tokenizer.tokenizer import single_column_mapping
 from ..optimizer import get_optimizer
 from ..scheduler import get_scheduler
@@ -72,7 +72,9 @@ def to_target_batch_size(
 def trainer(cfg: DictConfig):
     # Get the last checkpoint id
     checkpoint_dir = os.path.join(cfg.trainer.dir, "checkpoints")
+    dataset_checkpoint_dir = os.path.join(cfg.trainer.dir, "dataset_checkpoint")
     model_checkpoint_dir = os.path.join(cfg.trainer.dir, "model_checkpoints")
+    os.makedirs(dataset_checkpoint_dir, exist_ok=True)
     os.makedirs(model_checkpoint_dir, exist_ok=True)
     iteration = 0
     if cfg.trainer.resume and os.path.exists(checkpoint_dir) and len(os.listdir(checkpoint_dir)) > 0:
@@ -131,38 +133,48 @@ def trainer(cfg: DictConfig):
         dtype_pad_mask = torch.float16
     elif accelerator.mixed_precision == "bf16":
         dtype_pad_mask = torch.bfloat16
-
+    
+    print("loading tokenizer")
     # Tokenizer
     tokenizer = get_tokenizer(**cfg.tokenizer)
-
-
+    
+    print("loading dataset")
     # Dataset
     if cfg.dataset.name == "refinedweb" :
         dataset = load_dataset(cfg.dataset.train.path, streaming=True, split="train")
+
         features = Features({"input_ids": Sequence(Value("int32")), "attention_mask": Sequence(Value("bool"))})
         mapping = partial(single_column_mapping, tokenizer=tokenizer, column_name=cfg.dataset.column, max_length=cfg.tokenizer.max_length, truncation=True)
         train_dataset= dataset.shuffle(seed=42, buffer_size=10_000)
-        train_dataset = dataset.map(
+        train_dataset = train_dataset.map(
             mapping,
             batched=True,
             remove_columns=dataset.column_names,
             features=features,
         )
-            
+
+        # if cfg.trainer.resume and os.path.exists(dataset_checkpoint_dir) and len(os.listdir(dataset_checkpoint_dir)) > 0:
+        #     print("starting dataset from state dict")
+        #     dataset_state_dict = torch.load(os.path.join(dataset_checkpoint_dir, "iterableDataset.pt"))
+        #     print(dataset_state_dict)
+        #     dataset.load_state_dict(dataset_state_dict)
     else :
         train_dataset = load_from_disk(cfg.dataset.path_to_disk)
-
+    
     # Dataloader
     train_dataloader = get_dataloader(train_dataset, tokenizer, dtype=dtype_pad_mask, **cfg.dataloader.train, **cfg.datacollator)
-
+    
+    print("loading model")
     # Model
     model = NeoBERTLMHead(NeoBERTConfig(**cfg.model, **cfg.tokenizer, pad_token_id=tokenizer.pad_token_id))
     accelerator.log({"model_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad)})
-
+    
+    print("optim and schedul")
     # Optimizer and Scheduler
     optimizer = get_optimizer(model, accelerator.distributed_type, name=cfg.optimizer.name, **cfg.optimizer.hparams)
     scheduler = get_scheduler(optimizer=optimizer, lr=cfg.optimizer.hparams.lr, **cfg.scheduler)
-
+    
+    print("preparing accelerator")
     # Prepare with accelerate
     train_dataloader, model, optimizer, scheduler = accelerator.prepare(
         train_dataloader,
@@ -177,9 +189,12 @@ def trainer(cfg: DictConfig):
     # Resume from the latest checkpoint
     skipped_train_dataloader = None
     if cfg.trainer.resume and os.path.exists(checkpoint_dir) and len(os.listdir(checkpoint_dir)) > 0:
+        print("skipping examples")
         accelerator.load_state()
         train_dataloader.set_epoch(metrics["train/epochs"])
-        skipped_train_dataloader = accelerator.skip_first_batches(train_dataloader, metrics["train/batches"] % len(train_dataloader))
+        skipped_train_dataloader = accelerator.skip_first_batches(train_dataloader, metrics["train/batches"] % (cfg.trainer.max_steps//cfg.dataloader.train.batch_size))
+        print("done")
+
 
     # Progress bar
     pbar = tqdm(
@@ -189,6 +204,8 @@ def trainer(cfg: DictConfig):
         total=cfg.trainer.max_steps,
         disable=(cfg.trainer.disable_tqdm or not accelerator.is_main_process),
     )
+    
+    print("launching")
 
     while cfg.trainer.max_steps > metrics["train/steps"]:
         # Use skipped_train_dataloader the first epoch after resuming
@@ -200,7 +217,8 @@ def trainer(cfg: DictConfig):
             "labels": None,
         }
         i = 0
-        for batch in dataloader:
+        for id, batch in enumerate(dataloader):
+            # print("batch", id)
             # Update number of batches
             metrics["train/batches"] += 1
             i += 1
@@ -220,28 +238,37 @@ def trainer(cfg: DictConfig):
             if metrics["train/batches"] % cfg.trainer.gradient_accumulation_steps != 0:
                 with accelerator.no_sync(model):
                     # Forward pass
+                    # print("computing batch")
                     output = model(batch["input_ids"], batch.get("attention_mask", None))
+                    
+                    # print("OK")
 
                     logits = output["logits"]
                     
                     # print("logits", logits)
                     train_loss = train_loss_fn(logits.view(-1, cfg.tokenizer.vocab_size), batch["labels"].view(-1))
+                    # print("train loss", train_loss)
+
+                    metrics["train/CEL"] = train_loss.item()
 
                     entropy_loss = 0
                     if cfg.trainer.entropy_regularization_lambda > 0 :
                         all_pos_sem_attentions = output["all_pos_sem_attentions"] # listlayer, listpossem, [batch_size, num heads, seqlen, seqlen]
                         
                         for pos, sem in all_pos_sem_attentions :
-                            reg = (1 - compute_head_entropy(sem.half())/torch.log(torch.tensor(2 * sem.size(-1) - 1))) * compute_head_entropy(pos.half())
+                            reg = (1 - compute_head_entropy(sem)/torch.log(torch.tensor(2 * sem.size(-1) - 1))).detach() * compute_head_entropy(pos)
                             entropy_loss += reg.sum()
+                            #print(entropy_loss)
                         
+                        # print("entropy reg", entropy_loss)
+
                         metrics["train/local_sum_entropy_reg"] += entropy_loss.item() * batch["input_ids"].shape[0]
 
                     
 
                     
                     total_loss = train_loss + cfg.trainer.entropy_regularization_lambda * entropy_loss
-
+                    #print("total", total_loss)
                     accelerator.backward(total_loss)
 
 
@@ -269,23 +296,26 @@ def trainer(cfg: DictConfig):
                     all_pos_sem_attentions = output["all_pos_sem_attentions"] # listlayer, listpossem, [batch_size, num heads, seqlen, seqlen]
                     
                     for pos, sem in all_pos_sem_attentions :
-                        reg = (1 - compute_head_entropy(sem.half())/torch.log(torch.tensor(2 * sem.size(-1) - 1))) * compute_head_entropy(pos.half())
+                        reg = (1 - compute_head_entropy(sem)/torch.log(torch.tensor(2 * sem.size(-1) - 1))).detach() * compute_head_entropy(pos)
                         entropy_loss += reg.sum()
+                        #print(entropy_loss)
 
                     metrics["train/local_sum_entropy_reg"] += entropy_loss.item() * batch["input_ids"].shape[0]
-                
+            
+                    total_loss = train_loss + cfg.trainer.entropy_regularization_lambda * entropy_loss
 
-                total_loss = train_loss + cfg.trainer.entropy_regularization_lambda * entropy_loss
+                else :
+                    total_loss = train_loss
 
                 # print(train_loss, entropy_loss, cfg.trainer.entropy_regularization_lambda * entropy_loss, total_loss)
-
+                # print("BACKWARD!!!")
                 accelerator.backward(total_loss)
-
+                
                 if cfg.trainer.gradient_clipping is not None and cfg.trainer.gradient_clipping > 0:
                     accelerator.clip_grad_norm_(model.parameters(), cfg.trainer.gradient_clipping)
 
-                # Log metrics
                 pbar.update(1)
+                # Log metrics
                 metrics["train/total_loss"] += total_loss.item()
                 metrics["train/steps"] += 1
                 metrics["train/local_samples"] += batch["input_ids"].shape[0]
@@ -319,6 +349,11 @@ def trainer(cfg: DictConfig):
                 # Save the accelerator state from the main process
                 if metrics["train/steps"] % cfg.trainer.accelerate.save_steps == 0:
                     accelerator.save_state()
+                    if isinstance(train_dataset, IterableDataset) :
+                        torch.save(
+                                train_dataset.state_dict(),
+                                os.path.join(dataset_checkpoint_dir, "iterableDataset.pt"),
+                            )
 
                 # Save the pytorch model
                 if metrics["train/steps"] % cfg.trainer.model.save_steps == 0:
@@ -345,6 +380,8 @@ def trainer(cfg: DictConfig):
                             model.state_dict(),
                             os.path.join(path, "state_dict.pt"),
                         )
+                    
+
 
                 if metrics["train/steps"] >= cfg.trainer.max_steps:
                     break

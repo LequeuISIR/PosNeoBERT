@@ -4,13 +4,13 @@
 meta_task=glue
 
 # Model
-model=neobert
+model=JZ-softmax-detach-2-PosNeoBERT
 
 # Pretrained checkpoint
-ckpt=1000000
+ckpt=180000
 num_ckpt=1
 
-transfer_from_task=true
+transfer_from_task=false
 overwrite=false
 
 mixed_precision=fp16
@@ -27,10 +27,10 @@ if [[ ! -z "$6" ]]; then overwrite=$6; fi
 if [[ $model =~ bert-ablations* ]] ; then
     max_length=512
 else
-    max_length=1024
+    max_length=512
 fi
 from_hub=false
-fi
+
 
 # Function to print usage
 print_usage() {
@@ -57,11 +57,35 @@ fi
 # Initialize grid search arguments
 D=()
 
+# if [[ $meta_task=="glue" ]]; then
+#     for task in 'stsb' 'mrpc' 'rte' 'qnli' 'mnli' 'cola' 'sst2' 'qqp' 'mnli' ; do
+#         for batch_size in 16 32 4 8 2 ; do
+#             for lr in  6e-6 1e-5 2e-5 3e-5 8e-6 5e-6 ; do
+#                 for wd in 0.01 0.00001 ; do
+#                     for seed in 0; do
+#                         D+=("$task $batch_size $lr $seed $wd")
+#                     done
+#                 done
+#             done
+#         done
+#     done
+# else
+#     for dataset in 'axb' 'axg' 'boolq' 'cb' 'copa' 'multirc' 'record' 'rte' 'wic' 'wsc' ; do
+#         for batch_size in 4 8 16 32 64; do
+#             for lr in 6e-6 1e-5 2e-5 3e-5; do
+#                 for seed in 0; do
+#                     D+=("$dataset $batch_size $lr $seed")
+#                 done
+#             done
+#         done
+#     done
+# fi
+
 if [[ $meta_task=="glue" ]]; then
-    for task in 'stsb' 'mrpc' 'rte' 'qnli' 'mnli' 'cola' 'sst2' 'qqp' 'mnli' ; do
-        for batch_size in 16 32 4 8 2 ; do
-            for lr in  6e-6 1e-5 2e-5 3e-5 8e-6 5e-6 ; do
-                for wd in 0.01 0.00001 ; do
+    for task in 'stsb' ; do
+        for batch_size in 16 ; do
+            for lr in  2e-5 ; do
+                for wd in 0.01 ; do
                     for seed in 0; do
                         D+=("$task $batch_size $lr $seed $wd")
                     done
@@ -96,6 +120,6 @@ for i in "${!D[@]}"; do
     # Submit job if results do not exist or overwrite is allowed
     if [[ ! -f "$run_dir/all_results.json" || "$overwrite" = true ]]; then
         echo $meta_task $task $model $ckpt $batch_size $lr $seed $transfer_from_task $num_ckpt $from_hub $max_length $mixed_precision $early_stopping $wd
-        sbatch --job-name=glue-$model $HOME/neo-bert/jobs/glue/train.sh $meta_task $task $model $ckpt $batch_size $lr $seed $transfer_from_task $num_ckpt $from_hub $max_length $run_dir $mixed_precision $early_stopping $wd
+        sbatch --job-name=glue-$model $WORK/repos/PosNeoBERT/jobs/glue/train.sh $meta_task $task $model $ckpt $batch_size $lr $seed $transfer_from_task $num_ckpt $from_hub $max_length $run_dir $mixed_precision $early_stopping $wd
     fi
 done

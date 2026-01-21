@@ -1,15 +1,15 @@
 #!/bin/bash
-#SBATCH --job-name=glue-neobert
-#SBATCH --time=1-00:00:00
-#SBATCH --error=logs/glue/output_%x_%j.txt
-#SBATCH --output=logs/glue/output_%x_%j.txt
-#SBATCH --partition=dgxv100long         # ask for high-priority job
-#SBATCH --nodes=1                       # number of nodes
+#SBATCH --job-name=glue-detach-PosNeoBERT
+#SBATCH --time=10:00:00
+#SBATCH -C a100
+#SBATCH -A npl@a100
+#SBATCH --qos qos_gpu_a100-t3
+#SBATCH --nodes=1                    # number of nodes
 #SBATCH --ntasks-per-node=1             # crucial - only 1 task per node!
-#SBATCH --gres=gpu:1                      # number of gpus per node
-#SBATCH --cpus-per-task=4                # number of cpus per gpu
-#SBATCH --mem-per-gpu=32G               # memory per gpu
-# #SBATCH --dependency=afterok:19340
+#SBATCH --gpus-per-task=1           # number of gpus per node
+#SBATCH --cpus-per-task=8           # number of cpus per nod
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
 
 
 export HF_DATASETS_OFFLINE=1
@@ -37,9 +37,9 @@ export early_stopping=${14}
 export wd=${15}
 
 # Load modules, python environment and install local package
-source activate base
-conda init
-conda activate .venv
+# source activate base
+# conda init
+# conda activate .venv
 
 # cd $HOME/neo-bert
 # pip install -e .
@@ -59,7 +59,11 @@ echo "Transfering from matching task if available: $transfer_from_task"
 echo "Number of checkpoints to merge: $num_ckpt"
 echo "Weight decay: $wd"
 
-python $HOME/neo-bert/scripts/evaluation/run_glue.py \
+module load arch/h100
+module load pytorch-gpu/py3/2.5.0
+export PYTHONPATH=$WORK/repos/PosNeoBERT/src:$PYTHONPATH
+
+uv run $WORK/repos/PosNeoBERT/scripts/evaluation/run_glue.py \
     dataset=$meta_task \
     task=$task \
     hydra.run.dir=$run_dir/hydra \
