@@ -84,3 +84,8 @@ def apply_rotary_emb(
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
+
+if __name__ == "__main__" :
+    freq_cis = precompute_freqs_cis(48 // 6, 512)
+    print(freq_cis)
+    print(freq_cis.shape)

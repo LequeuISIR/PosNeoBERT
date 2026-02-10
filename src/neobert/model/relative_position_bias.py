@@ -19,15 +19,10 @@ class RelativePositionBias(nn.Module):
         pos1 = torch.arange(seq_len, dtype=torch.long, device=self.bias_table.device).view(-1, 1)
         pos2 = torch.arange(seq_len, dtype=torch.long, device=self.bias_table.device).view(1, -1)
         # diffs[i, j] = i - j
-        print(pos1)
-        print(pos2)
         relative_indices = pos2 - pos1
         
-        print("relative_indices")
-        print(relative_indices)
         # 2. Shift indices to be non-negative (from 0 to 2*L - 2)
         relative_indices = relative_indices + (self.max_distance)
-        print(relative_indices)
         # 3. Index into the bias table 
         # Output shape: (num_heads, seq_len, seq_len)
         return self.bias_table[:, relative_indices]
@@ -89,34 +84,52 @@ class RelativePositionBucketedBias(nn.Module):
         
         return relative_buckets
 
+    
     def forward(self, seq_len):
-        # Create distance grid: (seq_len_q, seq_len_k)
-        if seq_len == self.bucket_indices.shape[0]:
-            bucket_indices = self.bucket_indices
-        else:
-            # Fallback to dynamic computation if length changes (e.g., during eval)
-            grid_q = torch.arange(seq_len, dtype=torch.long, device=self.relative_attention_bias.device).view(-1, 1)
-            grid_k = torch.arange(seq_len, dtype=torch.long, device=self.relative_attention_bias.device).view(1, -1)
-            relative_position = grid_k - grid_q
+        # Slice the pre-computed buffer instead of recomputing
+        # This avoids the expensive math logic and branching
+        indices = self.bucket_indices[:seq_len, :seq_len]
+        # print(indices)
 
-            # Map to buckets
-            bucket_indices = self._relative_position_bucket(
-                relative_position, num_buckets=self.num_buckets, max_distance=self.max_distance
-            )
-                
-        # Look up biases: (seq_len_q, seq_len_k, num_heads)
-        values = self.relative_attention_bias[bucket_indices, :]
-        # Permute to (num_heads, seq_len, seq_len) for attention sum
-        return values.permute(2, 0, 1).unsqueeze(0) # Adding batch dim if needed
+        # Use a more efficient gather:
+        # Instead of [L, L, H], we want [H, L, L]
+        # We can view the bias as [H, Buckets] then gather
+        bias_table = self.relative_attention_bias.T # [num_heads, num_buckets]
+        
+        # This is often faster: Index into the flat table then reshape
+        # output shape: [num_heads, seq_len, seq_len]
+        out = bias_table[:, indices] 
+        
+        return out.unsqueeze(0) # [1, H, L, L]
+    
+    # def forward(self, seq_len):
+    #     # Create distance grid: (seq_len_q, seq_len_k)
+    #     if seq_len == self.bucket_indices.shape[0]:
+    #         bucket_indices = self.bucket_indices
+    #     else:
+    #         # Fallback to dynamic computation if length changes (e.g., during eval)
+    #         grid_q = torch.arange(seq_len, dtype=torch.long, device=self.relative_attention_bias.device).view(-1, 1)
+    #         grid_k = torch.arange(seq_len, dtype=torch.long, device=self.relative_attention_bias.device).view(1, -1)
+    #         relative_position = grid_k - grid_q
+
+    #         # Map to buckets
+    #         bucket_indices = self._relative_position_bucket(
+    #             relative_position, num_buckets=self.num_buckets, max_distance=self.max_distance
+    #         )
+                        
+    #     # Look up biases: (seq_len_q, seq_len_k, num_heads)
+    #     values = self.relative_attention_bias[bucket_indices, :]
+    #     # Permute to (num_heads, seq_len, seq_len) for attention sum
+    #     return values.permute(2, 0, 1).unsqueeze(0) # Adding batch dim if needed
     
 if __name__ == "__main__" :
     # pos_bias = RelativePositionBias(1, 8)
     # fw = pos_bias(10)
     # print(fw)
 
-    pos_bias = RelativePositionBucketedBias(12, 512, 32, 128)
-    fw = pos_bias(512)
-    print(fw.shape)
+    pos_bias = RelativePositionBucketedBias(1, 30, 10, 128)
+    fw = pos_bias(30)
+    # print(fw)
     
     fw = pos_bias(128)
     print(fw.shape)

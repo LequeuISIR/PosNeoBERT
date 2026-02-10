@@ -56,7 +56,7 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
     attn_weight = attn_activation_fct(attn_weight, dim=-1)
     attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
 
-    return attn_weight @ value
+    return attn_weight @ value, attn_weight
 
 
 def posbert_scaled_dot_product_attention(query, key, attn_mask=None, dropout_p=0.0,
@@ -125,23 +125,23 @@ class NeoBERTConfig(PretrainedConfig):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        if rope and posneobert :
-            raise ValueError("cant be rope and posneobert at the same time")
+        # if rope and posneobert :
+        #     raise ValueError("cant be rope and posneobert at the same time")
         if ngpt and posneobert :
             raise NotImplementedError
         if hidden_size % num_attention_heads != 0:
             raise ValueError("Hidden size must be divisible by the number of heads.")
         if pos_size % num_attention_heads != 0 :
             raise ValueError("Pos size must be divisible by the number of heads.")
-        if rope and use_only_sem_for_decoding :
+        if (not posneobert) and (use_only_sem_for_decoding) :
             raise ValueError("Cannot use RoPE and use only semantic for decoding.")
-        if rope and positional_embed_init == "2dim_cosine" :
+        if (not posneobert) and (positional_embed_init == "2dim_cosine") :
             raise ValueError("Cannot use RoPE and setup positional embeddings.")
-        if rope and shared_pos_keys :
+        if (not posneobert) and (shared_pos_keys) :
             raise ValueError("Cannot use RoPE and shared positional embeddings.")
-        if rope and relative_pos_bias :
+        if (not posneobert) and (relative_pos_bias) :
             raise ValueError("Cannot use RoPE and relative positional bias.")
-        if rope and mix_attentions == "hadamard" :
+        if (not posneobert) and (mix_attentions == "hadamard") :
             raise ValueError("Cannot setup mix attentions with RoPE.")
         
         if positional_embed_init not in ["random", "2dim_cosine"] :
@@ -341,7 +341,8 @@ class EncoderBlock(nn.Module):
             # print("x in forward", x)
 
         else :
-            x = x + self._att_block(self.attention_norm(x), pad_mask, freqs_cis)
+            new_x, attn_weight = self._att_block(self.attention_norm(x), pad_mask, freqs_cis)
+            x = x + new_x
             x = x + self._ff_block(self.ffn_norm(x))
 
         return x, attn_weight, pos_sem_weights
@@ -358,23 +359,25 @@ class EncoderBlock(nn.Module):
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
         
 
+        attn_weight = None
         # print("xqxk", xq, xk)
         if self.config.flash_attention:
             attn = memory_efficient_attention(query=xq, key=xk, value=xv, attn_bias=pad_mask, p=0)
         else:
             # Input and output are of dimension (B, H, M, K) (b_size, num_head, seqlength, h_dim)
 
-            attn = scaled_dot_product_attention(
+            attn, attn_weight = scaled_dot_product_attention(
                 query=xq.transpose(1, 2),
                 key=xk.transpose(1, 2),
                 value=xv.transpose(1, 2),
                 attn_mask=pad_mask,
                 dropout_p=self.config.dropout_prob if self.training else 0,
                 attn_activation_fct = self.attn_activation_fct
-            ).transpose(1, 2)
+            )
+            attn = attn.transpose(1, 2)
 
         # print("attention", attn)
-        return self.resid_dropout(self.wo(attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.config.dim_head)))
+        return self.resid_dropout(self.wo(attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.config.dim_head))), attn_weight
 
     def _posneobert_att_block(self, x: torch.Tensor, pad_mask: torch.Tensor, freqs_cis: torch.Tensor, shared_pos_keys: torch.Tensor | None = None):
         batch_size, seq_len, _ = x.shape
@@ -388,6 +391,9 @@ class EncoderBlock(nn.Module):
         xq_sem, xk_sem = self.qk_sem(x[..., self.config.pos_size:]).view(batch_size, seq_len, self.config.num_attention_heads, ((self.config.pos_size + self.config.hidden_size) // self.config.num_attention_heads) * 2).chunk(2, axis=-1)
         xv_pos = self.v_pos(x[..., :self.config.pos_size])
         xv_sem = self.v_sem(x[..., self.config.pos_size:])
+
+        if self.config.rope :
+            xq_pos, xk_pos = apply_rotary_emb(xq_pos, xk_pos, freqs_cis)
 
         pos_bias = self.relative_pos_bias(seq_len) if self.config.relative_pos_bias else None # (batch_size, num_heads, seq_len, seq_len) or None
 
@@ -623,7 +629,7 @@ class NeoBERT(NeoBERTPreTrainedModel):
         self.encoder = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
         self.shared_pos_encoder = nn.Linear(in_features=config.pos_size, out_features=(config.hidden_size + config.pos_size) // config.num_attention_heads) if config.shared_pos_keys else None
 
-        if self.config.rope:
+        if self.config.rope and not self.config.posneobert:
             self.freqs_cis = precompute_freqs_cis(config.hidden_size // config.num_attention_heads, config.max_length)
         elif self.config.posneobert:
             match config.positional_embed_init :
@@ -636,6 +642,9 @@ class NeoBERT(NeoBERTPreTrainedModel):
                     embs[:, :2] = torch.stack([torch.cos(angles)/10, torch.sin(angles)/10], dim=1)
                     self.positional_embedding = nn.Embedding.from_pretrained(embs, freeze=False)
                     self.positional_embedding._skip_weight_init = True
+            if self.config.rope :
+                self.freqs_cis = precompute_freqs_cis((self.config.pos_size + self.config.hidden_size) // config.num_attention_heads, config.max_length)
+
         
         else:
             self.positional_embedding = nn.Embedding(config.max_length + 1, config.hidden_size, padding_idx=config.pad_token_id)
@@ -679,29 +688,32 @@ class NeoBERT(NeoBERTPreTrainedModel):
         x = self.encoder(src)
 
         # Positional embedding
-        if not self.config.rope:
-            if not self.config.posneobert :
-                mask = src.ne(self.config.pad_token_id).int()
-                incremental_indices = (torch.cumsum(mask, dim=1).type_as(mask)) * mask  #
-                incremental_indices = incremental_indices.long() + self.config.pad_token_id
-                x += self.positional_embedding(incremental_indices)
-            else :
-                mask = src.ne(self.config.pad_token_id).int()
-                incremental_indices = (torch.cumsum(mask, dim=1).type_as(mask)) * mask  #
-                incremental_indices = incremental_indices.long() + self.config.pad_token_id
-                if self.training and self.config.random_offset:
-                    valid_lengths = mask.sum(dim=1)  # How many non-pad tokens per example
-                    max_offsets = (self.config.max_length - valid_lengths).clamp(min=0)
-         
-                    # Generate random offsets for all examples in a single call
-                    random_offsets =  torch.randint(0, max_offsets.max() + 1, (len(max_offsets),)).to(mask.device)
-                    random_offsets = random_offsets * (random_offsets <= max_offsets)
+        
+        if (not self.config.rope) and (not self.config.posneobert) :
+            mask = src.ne(self.config.pad_token_id).int()
+            incremental_indices = (torch.cumsum(mask, dim=1).type_as(mask)) * mask  #
+            incremental_indices = incremental_indices.long() + self.config.pad_token_id
+            x += self.positional_embedding(incremental_indices)
+        
+        if self.config.posneobert :
+            mask = src.ne(self.config.pad_token_id).int()
+            incremental_indices = (torch.cumsum(mask, dim=1).type_as(mask)) * mask  #
+            incremental_indices = incremental_indices.long() + self.config.pad_token_id
+            if self.training and self.config.random_offset:
+                valid_lengths = mask.sum(dim=1)  # How many non-pad tokens per example
+                max_offsets = (self.config.max_length - valid_lengths).clamp(min=0)
+        
+                # Generate random offsets for all examples in a single call
+                random_offsets =  torch.randint(0, max_offsets.max() + 1, (len(max_offsets),)).to(mask.device)
+                random_offsets = random_offsets * (random_offsets <= max_offsets)
 
-                    # Add the random offsets to the positional indices
-                    incremental_indices += random_offsets.unsqueeze(1) * mask  # Apply offset only to non-pad tokens
+                # Add the random offsets to the positional indices
+                incremental_indices += random_offsets.unsqueeze(1) * mask  # Apply offset only to non-pad tokens
 
-                positional_embed = self.positional_embedding(incremental_indices)
-                x = torch.concat([positional_embed, x], dim=-1)
+            positional_embed = self.positional_embedding(incremental_indices)
+            x = torch.concat([positional_embed, x], dim=-1)
+
+
 
         # Transformer encoder
 

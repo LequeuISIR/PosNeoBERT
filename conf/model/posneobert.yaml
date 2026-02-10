@@ -16,7 +16,7 @@ num_hidden_layers: 12
 num_attention_heads : 12
 hidden_size: 720
 pos_size: 48
-attention_ativation: softpick
+attention_activation: softpick
 untie_cls: false
 mix_attentions: sum
 random_offset: true

@@ -256,9 +256,15 @@ def trainer(cfg: DictConfig):
                         all_pos_sem_attentions = output["all_pos_sem_attentions"] # listlayer, listpos/sem, [batch_size, num heads, seqlen, seqlen]
                         
                         for pos, sem, bias in all_pos_sem_attentions :
-                            if bias: 
-                                pos = torch.add(pos, bias)
-                            reg = (1 - compute_head_entropy(sem)/torch.log(torch.tensor(2 * sem.size(-1) - 1))).detach() * compute_head_entropy(pos)
+                            if bias is not None :
+                                if cfg.trainer.bias_only_regularization :
+                                    pos_reg = bias
+                                else :
+                                    pos_reg = torch.add(pos, bias)
+                            else :
+
+                                pos_reg = pos 
+                            reg = (1 - compute_head_entropy(sem)/torch.log(torch.tensor(2 * sem.size(-1) - 1))).detach() * compute_head_entropy(pos_reg)
                             entropy_loss += reg.sum()
                             #print(entropy_loss)
                         
@@ -298,9 +304,15 @@ def trainer(cfg: DictConfig):
                     all_pos_sem_attentions = output["all_pos_sem_attentions"] # listlayer, listpossem, [batch_size, num heads, seqlen, seqlen]
                     
                     for pos, sem, bias in all_pos_sem_attentions :
-                        if bias: 
-                            pos = torch.add(pos, bias)
-                        reg = (1 - compute_head_entropy(sem)/torch.log(torch.tensor(2 * sem.size(-1) - 1))).detach() * compute_head_entropy(pos)
+                        if bias is not None :
+                            if cfg.trainer.bias_only_regularization :
+                                pos_reg = bias
+                            else :
+                                pos_reg = torch.add(pos, bias)
+                        else :
+
+                            pos_reg = pos 
+                        reg = (1 - compute_head_entropy(sem)/torch.log(torch.tensor(2 * sem.size(-1) - 1))).detach() * compute_head_entropy(pos_reg)
                         entropy_loss += reg.sum()
                         #print(entropy_loss)
 
