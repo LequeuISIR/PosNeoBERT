@@ -29,6 +29,7 @@ from .rotary import precompute_freqs_cis, apply_rotary_emb
 from .softpick import softpick
 from .override_CLS_SEP import CLSSEPAttentionReplacer
 from .relative_position_bias import RelativePositionBucketedBias
+from .swiglu import PosBERTSwiGLU
 
 # Efficient implementation equivalent to the following:
 def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
@@ -84,6 +85,21 @@ def posbert_scaled_dot_product_attention(query, key, attn_mask=None, dropout_p=0
     return attn_weight 
 
 
+class BlockDiagonalLayer(nn.Module):
+    def __init__(self, block1_size, block2_size):
+        super().__init__()
+        # Define the blocks as learnable parameters
+        self.block1 = nn.Parameter(torch.randn(block1_size, block1_size))
+        self.block2 = nn.Parameter(torch.randn(block2_size, block2_size))
+
+    def forward(self, x):
+        # Create the structural block diagonal matrix
+        # This happens every forward pass, enforcing the 0-blocks
+        W = torch.block_diag(self.block1, self.block2)
+        # self.weights = 
+        # Linear transformation: y = xW^T (or Wx depending on your shape)
+        return torch.matmul(x, W.t())
+    
 
 class NeoBERTConfig(PretrainedConfig):
     model_type = "neobert"
@@ -95,8 +111,8 @@ class NeoBERTConfig(PretrainedConfig):
         pos_size: int = 384,
         num_hidden_layers: int = 28,
         num_attention_heads: int = 12,
-        pos_intermediate_size: int =1536,
-        intermediate_size: int =3072,
+        pos_intermediate_size: int | None = None,
+        intermediate_size: int | None = None,
         pos_dropout_prob: float =0.1,
         dropout_prob: float =0.1,
         attention_probs_dropout_prob: float =0.1,
@@ -158,8 +174,8 @@ class NeoBERTConfig(PretrainedConfig):
         self.num_attention_heads = num_attention_heads
         
         self.dim_head = ((hidden_size + pos_size) // num_attention_heads) if posneobert else hidden_size // num_attention_heads
-        self.pos_intermediate_size = pos_intermediate_size
-        self.intermediate_size = intermediate_size
+        self.pos_intermediate_size = pos_intermediate_size or pos_size*4
+        self.intermediate_size = intermediate_size or hidden_size*4
         self.pos_dropout_prob = pos_dropout_prob
         self.dropout_prob = dropout_prob
         self.attention_probs_dropout_prob = attention_probs_dropout_prob
@@ -258,7 +274,14 @@ class EncoderBlock(nn.Module):
                         sem_intermediate_size = int(2 * (config.intermediate_size) / 3)
                         sem_intermediate_size = multiple_of * ((sem_intermediate_size + multiple_of - 1) // multiple_of)
                         self.sem_ffn = SwiGLU(config.hidden_size, sem_intermediate_size, config.hidden_size, bias=False)
-
+            
+            case "posbertswiglu":
+                multiple_of = 8
+                # if self.config.mixed_feed_forward :
+                intermediate_size = int(2 * (config.pos_intermediate_size + config.intermediate_size) / 3)
+                intermediate_size = multiple_of * ((intermediate_size + multiple_of - 1) // multiple_of)
+                self.ffn = PosBERTSwiGLU(config.hidden_size + config.pos_size, intermediate_size, config.hidden_size, config.pos_size, separate_w3=True )
+                
             case "gelu":
                 if not self.config.posneobert :
                     self.ffn = nn.Sequential(
@@ -384,6 +407,7 @@ class EncoderBlock(nn.Module):
 
         # print("x shape", x.shape)
         if self.config.shared_pos_keys :
+            raise NotImplementedError
             xq_pos = self.q_pos(x[..., :self.config.pos_size]).view(batch_size, seq_len, self.config.num_attention_heads, ((self.config.pos_size + self.config.hidden_size) // self.config.num_attention_heads))
             xk_pos = shared_pos_keys # is of shape [bs, sk, nh, hs] already, where all heads have the same data.
         else :
@@ -427,7 +451,7 @@ class EncoderBlock(nn.Module):
             )
 
         if self.config.untie_cls :
-            self.cls_sep_override(pos_attn_weight, pad_mask)
+            pos_attn_weight = self.cls_sep_override(pos_attn_weight, pad_mask)
 
         if self.config.mix_attentions == "sum" :
             attn_weight = torch.add(pos_attn_weight,sem_attn_weight)
@@ -461,18 +485,24 @@ class EncoderBlock(nn.Module):
 
         return self.resid_dropout(attn), attn_weight, [pos_attn_weight, sem_attn_weight, pos_bias]
 
-    def _ff_block(self, x: torch.Tensor):
-        return self.ffn_dropout(self.ffn(x))
-
-
     def _posneobert_ff_block(self, x:torch.Tensor):
+        if self.config.hidden_act.lower() == "posbertswiglu" :
+            return self.ffn_dropout(self.ffn(x))
+
         if self.config.mixed_feed_forward :
             x = self.ffn(x.clone().contiguous())
         else :
             x_pos = self.pos_ffn(x[..., :self.config.pos_size])
             x_sem = self.sem_ffn(x[..., self.config.pos_size:])
             x = torch.cat([x_pos, x_sem], dim=-1)
+
         return self.ffn_dropout(x)
+    
+    
+    def _ff_block(self, x: torch.Tensor):
+        return self.ffn_dropout(self.ffn(x))
+
+
     
 
 
@@ -612,11 +642,14 @@ class NeoBERTPreTrainedModel(PreTrainedModel):
             module.weight.data.uniform_(-self.config.embedding_init_range, self.config.embedding_init_range)
         elif isinstance(module, CLSSEPAttentionReplacer):
             # Initialize head-specific thetas randomly
-            module.theta_cls_out.data.uniform_(-self.config.decoder_init_range, self.config.decoder_init_range)
-            module.theta_cls_in.data.uniform_(-self.config.decoder_init_range, self.config.decoder_init_range)
-            module.theta_sep_out.data.uniform_(-self.config.decoder_init_range, self.config.decoder_init_range)
-            module.theta_sep_in.data.uniform_(-self.config.decoder_init_range, self.config.decoder_init_range)
-
+            try :
+                #old_version
+                module.theta_cls_out.data.uniform_(-self.config.decoder_init_range, self.config.decoder_init_range)
+                module.theta_cls_in.data.uniform_(-self.config.decoder_init_range, self.config.decoder_init_range)
+                module.theta_sep_out.data.uniform_(-self.config.decoder_init_range, self.config.decoder_init_range)
+                module.theta_sep_in.data.uniform_(-self.config.decoder_init_range, self.config.decoder_init_range)
+            except :
+                module.thetas.data.uniform_(-self.config.decoder_init_range, self.config.decoder_init_range)
 
 class NeoBERT(NeoBERTPreTrainedModel):
     config_class = NeoBERTConfig
