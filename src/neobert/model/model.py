@@ -219,9 +219,10 @@ class EncoderBlock(nn.Module):
             self.resid_dropout = nn.Dropout(config.dropout_prob)
         else :
             if self.config.shared_pos_keys :
+                raise NotImplementedError
                 self.q_pos = nn.Linear(in_features=config.pos_size, out_features=(config.hidden_size + config.pos_size), bias=False)
             else : 
-                self.qk_pos = nn.Linear(in_features=config.pos_size, out_features=(config.hidden_size + config.pos_size) * 2, bias=False)
+                self.qkv_pos = nn.Linear(in_features=config.pos_size, out_features=(config.hidden_size + config.pos_size) * 2 + config.pos_size, bias=False)
             
             if self.config.relative_pos_bias :
                 self.relative_pos_bias = RelativePositionBucketedBias(num_heads=self.config.num_attention_heads, 
@@ -229,9 +230,9 @@ class EncoderBlock(nn.Module):
                                                                       num_buckets=32,
                                                                       max_distance=128)
 
-            self.qk_sem = nn.Linear(in_features=config.hidden_size, out_features=(config.hidden_size + config.pos_size) * 2, bias=False)
-            self.v_pos = nn.Linear(in_features=config.pos_size, out_features=config.pos_size, bias=False)
-            self.v_sem = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
+            self.qkv_sem = nn.Linear(in_features=config.hidden_size, out_features=(config.hidden_size + config.pos_size) * 2 + config.hidden_size, bias=False)
+            # self.v_pos = nn.Linear(in_features=config.pos_size, out_features=config.pos_size, bias=False)
+            # self.v_sem = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
             self.wo_pos = nn.Linear(in_features=config.pos_size, out_features=config.pos_size, bias=False)
             self.wo_sem = nn.Linear(in_features=config.hidden_size, out_features=config.hidden_size, bias=False)
             self.resid_dropout = nn.Dropout(config.dropout_prob)
@@ -410,11 +411,35 @@ class EncoderBlock(nn.Module):
             raise NotImplementedError
             xq_pos = self.q_pos(x[..., :self.config.pos_size]).view(batch_size, seq_len, self.config.num_attention_heads, ((self.config.pos_size + self.config.hidden_size) // self.config.num_attention_heads))
             xk_pos = shared_pos_keys # is of shape [bs, sk, nh, hs] already, where all heads have the same data.
-        else :
-            xq_pos, xk_pos = self.qk_pos(x[..., :self.config.pos_size]).view(batch_size, seq_len, self.config.num_attention_heads, ((self.config.pos_size + self.config.hidden_size) // self.config.num_attention_heads) * 2).chunk(2, axis=-1)
-        xq_sem, xk_sem = self.qk_sem(x[..., self.config.pos_size:]).view(batch_size, seq_len, self.config.num_attention_heads, ((self.config.pos_size + self.config.hidden_size) // self.config.num_attention_heads) * 2).chunk(2, axis=-1)
-        xv_pos = self.v_pos(x[..., :self.config.pos_size])
-        xv_sem = self.v_sem(x[..., self.config.pos_size:])
+        # else :
+        
+        # 1. Project to the flat total dimension
+        raw_qkv_pos = self.qkv_pos(x[..., :self.config.pos_size]) # [B, L, Total_Pos_Dim]
+        raw_qkv_sem = self.qkv_sem(x[..., self.config.pos_size:]) # [B, L, Total_Sem_Dim]
+
+        # 2. Split the total dimension (Dim -1)
+        # Note: qk_dim here is the TOTAL dimension across all heads
+        qk_dim = self.config.hidden_size + self.config.pos_size
+
+        xq_pos, xk_pos, xv_pos = torch.split(raw_qkv_pos, [qk_dim, qk_dim, self.config.pos_size], dim=-1)
+        xq_sem, xk_sem, xv_sem = torch.split(raw_qkv_sem, [qk_dim, qk_dim, self.config.hidden_size], dim=-1)
+
+        # 3. Now reshape into heads
+        # We calculate head_dim for each specifically
+        head_qk = qk_dim // self.config.num_attention_heads
+        head_v_pos = self.config.pos_size // self.config.num_attention_heads
+        head_v_sem = self.config.hidden_size // self.config.num_attention_heads
+
+        def reshape_heads(t, h_dim):
+            return t.view(batch_size, seq_len, self.config.num_attention_heads, h_dim)
+
+        xq_pos = reshape_heads(xq_pos, head_qk)
+        xk_pos = reshape_heads(xk_pos, head_qk)
+        xv_pos = reshape_heads(xv_pos, head_v_pos)
+
+        xq_sem = reshape_heads(xq_sem, head_qk)
+        xk_sem = reshape_heads(xk_sem, head_qk)
+        xv_sem = reshape_heads(xv_sem, head_v_sem)
 
         if self.config.rope :
             xq_pos, xk_pos = apply_rotary_emb(xq_pos, xk_pos, freqs_cis)
@@ -481,7 +506,7 @@ class EncoderBlock(nn.Module):
 
         pos_attn = self.wo_pos(pos_attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.pos_attention_head_size))
         sem_attn = self.wo_sem(sem_attn.reshape(batch_size, seq_len, self.config.num_attention_heads * self.sem_attention_head_size))
-        attn = torch.cat([pos_attn, sem_attn], dim=-1).to(x.dtype).contiguous()
+        attn = torch.cat([pos_attn, sem_attn], dim=-1).to(x.dtype)
 
         return self.resid_dropout(attn), attn_weight, [pos_attn_weight, sem_attn_weight, pos_bias]
 
@@ -642,14 +667,7 @@ class NeoBERTPreTrainedModel(PreTrainedModel):
             module.weight.data.uniform_(-self.config.embedding_init_range, self.config.embedding_init_range)
         elif isinstance(module, CLSSEPAttentionReplacer):
             # Initialize head-specific thetas randomly
-            try :
-                #old_version
-                module.theta_cls_out.data.uniform_(-self.config.decoder_init_range, self.config.decoder_init_range)
-                module.theta_cls_in.data.uniform_(-self.config.decoder_init_range, self.config.decoder_init_range)
-                module.theta_sep_out.data.uniform_(-self.config.decoder_init_range, self.config.decoder_init_range)
-                module.theta_sep_in.data.uniform_(-self.config.decoder_init_range, self.config.decoder_init_range)
-            except :
-                module.thetas.data.uniform_(-self.config.decoder_init_range, self.config.decoder_init_range)
+            module.thetas.data.uniform_(-self.config.decoder_init_range, self.config.decoder_init_range)
 
 class NeoBERT(NeoBERTPreTrainedModel):
     config_class = NeoBERTConfig
@@ -1125,7 +1143,7 @@ class NeoBERTForMTEB(NeoBERTPreTrainedModel):
             dataset,
             collate_fn=data_collator,
             batch_size=self.batch_size,
-            num_workers=2,
+            num_workers=4,
             shuffle=False,
             pin_memory=True,
         )
