@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 # from torch.nn.functional import scaled_dot_product_attention
+import torch.nn.functional as F
 
 from typing import Any, Dict, List, Optional
 from functools import partial
@@ -160,7 +161,7 @@ class NeoBERTConfig(PretrainedConfig):
         if (not posneobert) and (mix_attentions == "hadamard") :
             raise ValueError("Cannot setup mix attentions with RoPE.")
         
-        if positional_embed_init not in ["random", "2dim_cosine"] :
+        if positional_embed_init not in ["random", "2dim_cosine", "fixed"] :
             raise ValueError
         if attention_activation not in ["softmax", "softpick"] :
             raise ValueError
@@ -684,6 +685,13 @@ class NeoBERT(NeoBERTPreTrainedModel):
             self.freqs_cis = precompute_freqs_cis(config.hidden_size // config.num_attention_heads, config.max_length)
         elif self.config.posneobert:
             match config.positional_embed_init :
+                case "fixed" :
+                    embs = torch.full((config.max_length + 1, config.pos_size), 1/math.sqrt(config.max_length))
+                    # Register as a buffer: it moves with the model to GPU, but isn't a 'parameter'
+                    self.register_buffer("pos_embs", embs)
+                    # embs = torch.full((config.max_length + 1, config.pos_size), 1/math.sqrt(config.max_length))
+                    # self.positional_embedding = nn.Embedding.from_pretrained(embs, freeze=True)
+                    # self.positional_embedding._skip_weight_init = True
                 case "random" :
                     self.positional_embedding = nn.Embedding(config.max_length + 1, config.pos_size, padding_idx=config.pad_token_id)
                 case "2dim_cosine" :
@@ -747,21 +755,27 @@ class NeoBERT(NeoBERTPreTrainedModel):
             x += self.positional_embedding(incremental_indices)
         
         if self.config.posneobert :
+            
+
             mask = src.ne(self.config.pad_token_id).int()
             incremental_indices = (torch.cumsum(mask, dim=1).type_as(mask)) * mask  #
             incremental_indices = incremental_indices.long() + self.config.pad_token_id
-            if self.training and self.config.random_offset:
-                valid_lengths = mask.sum(dim=1)  # How many non-pad tokens per example
-                max_offsets = (self.config.max_length - valid_lengths).clamp(min=0)
-        
-                # Generate random offsets for all examples in a single call
-                random_offsets =  torch.randint(0, max_offsets.max() + 1, (len(max_offsets),)).to(mask.device)
-                random_offsets = random_offsets * (random_offsets <= max_offsets)
+            if self.config.positional_embed_init == "fixed" :
+                positional_embed = F.embedding(incremental_indices, self.pos_embs)
+            
+            else :
+                if self.training and self.config.random_offset:
+                    valid_lengths = mask.sum(dim=1)  # How many non-pad tokens per example
+                    max_offsets = (self.config.max_length - valid_lengths).clamp(min=0)
+            
+                    # Generate random offsets for all examples in a single call
+                    random_offsets =  torch.randint(0, max_offsets.max() + 1, (len(max_offsets),)).to(mask.device)
+                    random_offsets = random_offsets * (random_offsets <= max_offsets)
 
-                # Add the random offsets to the positional indices
-                incremental_indices += random_offsets.unsqueeze(1) * mask  # Apply offset only to non-pad tokens
-
-            positional_embed = self.positional_embedding(incremental_indices)
+                    # Add the random offsets to the positional indices
+                    incremental_indices += random_offsets.unsqueeze(1) * mask  # Apply offset only to non-pad tokens
+                    positional_embed = self.positional_embedding(incremental_indices)
+                    
             x = torch.concat([positional_embed, x], dim=-1)
 
 
