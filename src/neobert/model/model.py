@@ -267,6 +267,8 @@ class EncoderBlock(nn.Module):
                     if self.config.mixed_feed_forward :
                         intermediate_size = int(2 * (config.pos_intermediate_size + config.intermediate_size) / 3)
                         intermediate_size = multiple_of * ((intermediate_size + multiple_of - 1) // multiple_of)
+                        print("intermediate_size".upper())
+                        print(intermediate_size)
                         self.ffn = SwiGLU(config.hidden_size + config.pos_size, intermediate_size, config.hidden_size + config.pos_size, bias=False)
                     else :
                         pos_intermediate_size = int(2 * (config.pos_intermediate_size) / 3)
@@ -755,8 +757,6 @@ class NeoBERT(NeoBERTPreTrainedModel):
             x += self.positional_embedding(incremental_indices)
         
         if self.config.posneobert :
-            
-
             mask = src.ne(self.config.pad_token_id).int()
             incremental_indices = (torch.cumsum(mask, dim=1).type_as(mask)) * mask  #
             incremental_indices = incremental_indices.long() + self.config.pad_token_id
@@ -774,7 +774,7 @@ class NeoBERT(NeoBERTPreTrainedModel):
 
                     # Add the random offsets to the positional indices
                     incremental_indices += random_offsets.unsqueeze(1) * mask  # Apply offset only to non-pad tokens
-                    positional_embed = self.positional_embedding(incremental_indices)
+                positional_embed = self.positional_embedding(incremental_indices)
                     
             x = torch.concat([positional_embed, x], dim=-1)
 
